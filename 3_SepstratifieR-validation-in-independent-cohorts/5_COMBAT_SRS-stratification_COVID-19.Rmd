@@ -1,0 +1,982 @@
+---
+title: "Stratificaiton of COVID-19 patients from the COMBAT cohort based on whole-blood transciptomes"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading libraries
+```{r load_libraries, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(reshape2)
+library(SummarizedExperiment)
+library(SepstratifieR)
+library(caret)
+library(survival)
+library(survminer)
+library(zoo)
+library(limma)
+library(XGR)
+library(mediation)
+library(ggrepel)
+library(ggExtra)
+library(cowplot)
+library(UpSetR)
+```
+
+## Loading data
+Loading a validation set containing samples from healthy individual, COVID-19 patients, and sepsis patients in the COMBAT consortium.
+```{r load_combat_data, message=FALSE, warning=FALSE}
+combat_RNAseq <- readRDS("../data/gains2_gex/COMBAT_total-RNAseq_log2-cpm.rds")
+```
+
+```{r filter_samples, message=FALSE, warning=FALSE}
+# Keeping only COVID-19 and control samples
+combat_RNAseq <- combat_RNAseq[,combat_RNAseq$Source != "Sepsis"]
+```
+
+## Exploratory analysis
+Performing principal component analysis based on all genes
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca_res <- prcomp(t(assay(combat_RNAseq)))
+```
+
+Fetching PCA coordinates and the variance explained by each component.
+```{r fetch_pc_coords, message=FALSE, warning=FALSE}
+pc_coords <- data.frame(cbind(pca_res$x,colData(combat_RNAseq)))
+pc_vars <- pca_res$sdev^2/sum(pca_res$sdev^2)
+```
+
+Samples separate by COVID-19 severity along PC1
+```{r plot_pca, message=FALSE, warning=FALSE, echo=FALSE}
+pc_coords$Source <- factor(pc_coords$Source,
+                           levels=c("HV","COVID_HCW_MILD","COVID_MILD","COVID_SEV","COVID_CRIT"))
+
+g1 <- ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=Source), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  scale_color_manual(values=rev(c("#fc8d59","#fee090","#e0f3f8","#91bfdb","#4575b4"))) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "bottom", 
+        legend.justification = "centre",
+        legend.text = element_text(size=8),
+        legend.title = element_blank())
+ggMarginal(g1, type = "density", groupFill = T)
+```
+
+## Stratifying samples into SRS groups
+Defining a set of predictor genes
+```{r define_predictor_genes, message=FALSE, warning=FALSE}
+predictor_genes <- read.table("../results/extended-predictor-gene-set.tsv", sep="\t", header=T)
+```
+
+Extracting predictor variables in this set
+```{r fetch_predictor_variables_combat, message=FALSE, warning=FALSE}
+predictors_combat <- data.frame(t(assay(combat_RNAseq[predictor_genes$gene_id,])))
+```
+
+Predicting SRS labels and quantitative sepsis scores (SRSq) for all samples in the data set.
+```{r predict_labels_combat, message=FALSE, warning=FALSE}
+preds_combat <- stratifyPatients(predictors_combat, gene_set = "extended", k=50)
+
+combat_RNAseq$SRS <- preds_combat@SRS
+combat_RNAseq$SRSq <- preds_combat@SRSq
+```
+
+The number of samples per SRS group in this cohort is as follows:
+```{r tabulate_SRS, message=FALSE, warning=FALSE}
+table(preds_combat@SRS)
+```
+
+Assessing the alignment of this data set to the reference set.
+```{r plot_alignment, message=FALSE, warning=FALSE}
+plotAlignedSamples(preds_combat)
+```
+
+Assessing if any potential outliers exist
+```{r plot_sample_alignment_by_mNN_outlier, message=FALSE, warning=FALSE}
+outlier_plots <- list()
+for(i in 2:7){
+ outlier_plots[[i-1]] <- plotAlignedSamples(preds_combat, color_by = "mNN_outlier", pcs = c(1,i))
+}
+
+plot_grid(plotlist = outlier_plots, ncol=2, nrow=3)
+```
+
+Assessing the impact of the choice of 'k' on predictions
+```{r run_sensitivity_analysis, message=FALSE, warning=FALSE}
+sensitivity_results <- runSensitivityAnalysis(predictors_combat, gene_set = "extended", verbose = F)
+```
+
+Visualising predictions in PCA space.
+```{r plot_pca_by_SRS, message=FALSE, warning=FALSE}
+pc_coords$SRS <- preds_combat@SRS
+pc_coords$SRSq <- preds_combat@SRSq
+
+g1 <- ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=SRS), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "bottom", 
+        legend.justification = "centre",
+        legend.text = element_text(size=8),
+        legend.title = element_blank())
+ggMarginal(g1, type = "density", groupFill = T)
+
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=SRSq), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  scale_color_gradient2(low = "lightgrey", mid = "steelblue", high = "darkblue", midpoint = 0.5) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "bottom", 
+        legend.justification = "centre",
+        legend.text = element_text(size=8),
+        legend.title = element_blank())
+```
+
+
+## Identifying SRS-associated gene expression programs
+Let's now use limma to identify genes whose expression levels are associated with SRSq.
+
+We start by defining a model matrix, with SRSq as the independent variable. 
+```{r define_design_matrix, message=FALSE, warning=FALSE}
+# SRS
+SRS_labels <- factor(combat_RNAseq$SRS, levels = c("SRS1","SRS2","SRS3"))
+design_matrix_SRS <- model.matrix( ~ 0 + SRS_labels)
+colnames(design_matrix_SRS) <-c("SRS1","SRS2","SRS3")
+
+# SRSq
+design_matrix_SRSq <- model.matrix(~combat_RNAseq$SRSq)
+```
+
+We then test for an association between gene expression level and SRSq using limma.
+```{r test_for_differential_expression, message=FALSE, warning=FALSE}
+# SRS
+fit_SRS <- lmFit(assay(combat_RNAseq), design_matrix_SRS)
+contrast_matrix_SRS <- makeContrasts(SRS1-SRS2, levels=design_matrix_SRS)
+
+fit2_SRS <- contrasts.fit(fit_SRS, contrast_matrix_SRS)
+fit2_SRS <- eBayes(fit2_SRS)
+
+# SRSq
+fit_SRSq <- lmFit(assay(combat_RNAseq), design_matrix_SRSq)
+
+fit2_SRSq <- contrasts.fit(fit_SRSq, coef = 2)
+fit2_SRSq <- eBayes(fit2_SRSq)
+```
+
+Finally, we retrieve the relevant statistics for any differentially expressed genes from limma's fit objects. For SRSq comparisons, we define differentially expressed genes as |fold change| >= 3.5 at an FDR <= 0.05. A fold-change of 3.5 is approximately equivalent to a 1-fold increase in gene expression for every 0.3-unit increase in SRSq. 
+```{r extract_DE_genes, message=FALSE, warning=FALSE}
+# SRS
+DEGs_SRS <- topTable(fit2_SRS, adjust="BH", number = nrow(combat_RNAseq))
+DEGs_SRS$gene_id <- rownames(DEGs_SRS)
+DEGs_SRS$gene_name <- rowData(combat_RNAseq)[DEGs_SRS$gene_id,]$gene_name
+DEGs_SRS$DE <- abs(DEGs_SRS$logFC) >= log2(1.5) & DEGs_SRS$adj.P.Val <= 0.05
+
+# SRSq
+DEGs_SRSq <- topTable(fit2_SRSq, adjust="BH", number = nrow(combat_RNAseq))
+DEGs_SRSq$gene_id <- rownames(DEGs_SRSq)
+DEGs_SRSq$gene_name <- rowData(combat_RNAseq)[DEGs_SRSq$gene_id,]$gene_name
+DEGs_SRSq$DE <- abs(DEGs_SRSq$logFC) >= log2(3.5) & DEGs_SRSq$adj.P.Val <= 0.05
+```
+
+A volcano plot representation of differentialy expressed genes looks as follows:
+```{r create_volcano_plot, message=FALSE, warning=FALSE, echo=FALSE}
+# SRS
+top_genes_SRS <- c(rownames(DEGs_SRS[DEGs_SRS$DE==T & DEGs_SRS$logFC > 0,])[1:15],
+                    rownames(DEGs_SRS[DEGs_SRS$DE==T & DEGs_SRS$logFC < 0,])[1:10])
+
+ggplot(DEGs_SRS, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRS, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRS[top_genes_SRS,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle("SRS-associated genes") +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+
+# SRSq
+top_genes_SRSq <- c(rownames(DEGs_SRSq[DEGs_SRSq$DE==T & DEGs_SRSq$logFC > 0,])[1:15],
+                    rownames(DEGs_SRSq[DEGs_SRSq$DE==T & DEGs_SRSq$logFC < 0,])[1:10])
+
+ggplot(DEGs_SRSq, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRSq, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRSq[top_genes_SRSq,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle("SRSq-associated genes") +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+```
+
+Below are some example genes known to be differentially expressed between SRS groups in GAinS.
+```{r create_volcano_plot_example_genes, message=FALSE, warning=FALSE, echo=FALSE}
+example_genes <- c("EMR3","GZMK","CD27","GZMH","CCR3","HLA-DMB","HLAC","CD6","CD177","MMP8","HPGD","TDRD9","GPR84","TNFAIP8L3")
+
+# SRS
+ggplot(DEGs_SRS, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRS, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRS[DEGs_SRS$gene_name %in% example_genes,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle("SRS-associated genes\n") +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+
+# SRSq
+ggplot(DEGs_SRSq, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRSq, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRSq[DEGs_SRSq$gene_name %in% example_genes,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle("SRSq-associated genes\n") +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+```
+
+The top SRSq-associated genes identified in GAinS look as follows in COMBAT:
+```{r plot_gex_vs_SRSq_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+gains_top_genes <- c("DYSF","RAB31","ALOX5","SLC25A38","AGFG2","PDCD11")
+cat(round(mean(gains_top_genes %in% DEGs_SRSq$gene_name[DEGs_SRSq$adj.P.Val < 0.05])*100,2),
+    "% of top SRSq-associated genes in GAinS also pass FDR correction in COMBAT\n", sep="")
+
+par(mfrow=c(2,3))
+for(i in intersect(gains_top_genes,DEGs_SRSq$gene_name)){
+  gene_id <- rowData(combat_RNAseq)$gene_id[rowData(combat_RNAseq)$gene_name == i]
+  print(
+    plot(combat_RNAseq$SRSq,
+     assay(combat_RNAseq[gene_id,]),
+     col = combat_RNAseq$SRS,
+     main=i,
+     xlab="SRSq",
+     ylab="Log-transformed expression",
+     pch=19)
+  )
+}
+```
+
+Let's compare these fold-change estimates with those calculated in the GAinS cohort.
+```{r load_gains_LFCs, message=FALSE, warning=FALSE}
+DEGs_gains <- read.table("../results/differential_gene_expression/GAinS/GAinS-RNAseq_DEGs_SRSq_limma_extended-signature.tsv", sep="\t", header=T)
+
+rownames(DEGs_gains) <- DEGs_gains$gene_id
+```
+
+```{r find_shared_genes, message=FALSE, warning=FALSE}
+shared_genes <- intersect(rownames(DEGs_gains), rownames(DEGs_SRSq))
+```
+
+```{r compute_LFC_corelation, message=FALSE, warning=FALSE}
+cor_res <- cor.test(DEGs_gains[shared_genes,]$logFC, DEGs_SRSq[shared_genes,]$logFC)
+cor_res
+```
+
+
+Approximately 14,000 genes are detected in both studies and there is a significant correlation between SRSq-associated log-fold changes in both studies. 
+
+This correlation looks as follows:
+```{r plot_LFC_correlation, message=FALSE, warning=FALSE, echo=FALSE}
+plot(DEGs_gains[shared_genes,]$logFC,
+     DEGs_SRSq[shared_genes,]$logFC,
+     col="darkgrey",
+     pch=19,
+     xlab="Log-fold change (GAinS RNA-seq cohort)",
+     ylab="Log-fold change (COMBAT cohort)",
+     main=paste("Cor =", round(cor_res$estimate,2), "\np < 2.2e-16"))
+```
+
+Let's export these results as a text file for future reference.
+```{r export_DE_genes, eval=FALSE}
+# SRS
+write.table(DEGs_SRS[order(-DEGs_SRS$logFC),], 
+            file = "../results/differential_gene_expression/COMBAT/COMBAT_DEGs_SRS1-vs-SRS2_limma_extended-signature.tsv",
+            quote = F, row.names = F, sep="\t")
+
+# SRSq
+write.table(DEGs_SRSq[order(-DEGs_SRSq$logFC),], 
+            file = "../results/differential_gene_expression/COMBAT/COMBAT_DEGs_SRSq_limma_extended-signature.tsv",
+            quote = F, row.names = F, sep="\t")
+```
+
+### Pathway enrichment analysis
+Next, let's assess whether genes positively or negatively associated with SRSq are enriched in any relevant biological pathways. We use the XGR method to test for enrichment in REACTOME pathways.
+```{r run_XGR, eval=FALSE}
+## Upregulated genes
+XGR_up <- xEnricherGenes(data=DEGs$gene_name[DEGs$DE & DEGs$logFC > 0],
+                         background = DEGs$gene_name,
+                         ontology="	MsigdbC2REACTOME")
+## Downregulated genes
+XGR_down <- xEnricherGenes(data=DEGs$gene_name[DEGs$DE & DEGs$logFC < 0], 
+                                       background = DEGs$gene_name,
+                                       ontology="MsigdbC2REACTOME")
+```
+
+```{r load_XGR_results, warning=FALSE, message=FALSE, echo=FALSE}
+load("../results/differential_gene_expression/COMBAT/XGR-results-COMBAT_extended-signature.rdata")
+```
+
+We then subset these results to include only significantly-enriched biological terms.
+```{r format_XGR_results, warning=FALSE, message=FALSE}
+## Reformatting results table
+XGR_up <- xEnrichViewer(XGR_up, top_num=length(XGR_up$adjp), sortBy="fc", details=TRUE)
+XGR_down <- xEnrichViewer(XGR_down, top_num=length(XGR_down$adjp), sortBy="fc", details=TRUE)
+
+## Keeping only significantly enriched pathways
+XGR_up <- XGR_up[XGR_up$adjp <= 0.05,]
+XGR_down <- XGR_down[XGR_down$adjp <= 0.05,]
+```
+
+In order to simplify the full output, we will focus exclusively on pathways matching at least one word in a bank of common immune terms.
+```{r define_immune_terms, message=FALSE, warning=FALSE}
+immune_terms <- c("NOTCH","TLR","Interleukin","NFk","MHC","(m|M)etabolism","Immun","ZAP-70","PD(-)?1","TCR","BCR","CD28","mTORC","SMAD","IFN","TGF","TRAF","Inflam","IRF","CTLA(-)?4","CD3","Interferon")
+```
+
+When assessing pathway enrichment, the results look as follows:
+```{r plot_SRS_associated_pathways, message=FALSE, warning=FALSE, echo=FALSE}
+XGR_up$name <- factor(XGR_up$name, levels=rev(XGR_up$name[order(-XGR_up$or)]))
+ggplot(XGR_up[grepl(paste(immune_terms, collapse="|"), XGR_up$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkred") +
+  geom_hline(yintercept = log2(1), color="darkred", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("Positive enrichment along SRSq") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+
+XGR_down$name <- factor(XGR_down$name, levels=rev(XGR_down$name[order(-XGR_down$or)]))
+ggplot(XGR_down[grepl(paste(immune_terms, collapse="|"), XGR_down$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkblue") +
+  geom_hline(yintercept = log2(1), color="darkblue", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("Negative enrichment along SRSq") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+```
+
+
+## Assessing the association between SRSq and clinical outcomes
+### 1. Severity of illness
+There is a clear association between SRS and severity of illness
+```{r create_severity_vs_SRS_upset_plot, message=FALSE, warning=FALSE, echo=FALSE}
+upset(
+  fromList(
+    list(
+      "SRS1" = combat_RNAseq$RNASeq_sample_ID[combat_RNAseq$SRS=="SRS1"],
+      "SRS2" = combat_RNAseq$RNASeq_sample_ID[combat_RNAseq$SRS=="SRS2"],
+      "SRS3" = combat_RNAseq$RNASeq_sample_ID[combat_RNAseq$SRS=="SRS3"],
+      "Healthy controls" = combat_RNAseq$RNASeq_sample_ID[combat_RNAseq$Source=="HV"],
+      "Community COVID-19" = combat_RNAseq$RNASeq_sample_ID[combat_RNAseq$Source=="COVID_HCW_MILD"],
+      "Mild COVID-19" = combat_RNAseq$RNASeq_sample_ID[combat_RNAseq$Source=="COVID_MILD"],
+      "Severe COVID-19" = combat_RNAseq$RNASeq_sample_ID[combat_RNAseq$Source=="COVID_SEV"],
+      "Critical COVID-19" = combat_RNAseq$RNASeq_sample_ID[combat_RNAseq$Source=="COVID_CRIT"]
+      )
+    ), 
+  order.by = "freq", 
+  sets = c("Critical COVID-19", "Severe COVID-19", "Mild COVID-19", "Community COVID-19", "Healthy controls", "SRS1", "SRS2", "SRS3"), 
+  keep.order = T
+)
+```
+
+This can also be visualised in terms of Jaccard indexes.
+```{r define_getJaccardIndex, message=FALSE, warning=FALSE}
+getJaccardIndex <- function(a,b){
+  if( length(union(a,b)) == 0 ){
+    jaccard_index = 0
+  } else{
+   jaccard_index = length(intersect(a,b))/length(union(a,b)) 
+  }
+  
+  return(jaccard_index)
+}
+```
+
+```{r plot_jaccard_indexes_SRS_vs_severity, message=FALSE, warning=FALSE, echo=FALSE}
+jaccard_indexes <- data.frame(
+  sapply(unique(combat_RNAseq$Source), FUN=function(i) {
+    sapply(unique(combat_RNAseq$SRS), FUN=function(j){
+      getJaccardIndex(colnames(combat_RNAseq)[combat_RNAseq$Source == i], 
+                      colnames(combat_RNAseq)[combat_RNAseq$SRS==j])
+      })
+    })
+  )
+rownames(jaccard_indexes) <- unique(combat_RNAseq$SRS)
+
+pheatmap::pheatmap(t(jaccard_indexes), cellheight=25, cellwidth=30, show_colnames = T)
+```
+
+This is even more apparent at the level of SRSq scores.
+```{r plot_SRSq_per_severity_group, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=Source, y=SRSq)) +
+  geom_boxplot() +
+  geom_jitter(aes(color=Source), width=0.1, alpha=0.7, size=2) +
+  stat_compare_means() +
+  scale_color_manual(values=c("#c7e9b4","#7fcdbb","#41b6c4","#1d91c0","#225ea8","#0c2c84")) +
+  ylab("SRSq") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        axis.title.y = element_blank(), 
+        legend.position = "none")
+```
+
+### 2. SOFA scores
+An association is also observed between SRSq and organ dysfunction scores (SOFA).
+```{r plot_SRSq_vs_SOFA, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=SRSq, y=SOFA)) +
+  geom_smooth(method="lm") +
+   geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ggtitle(
+     paste("\u03C1 = ", 
+          round(cor(pc_coords$SRSq, pc_coords$SOFA, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, pc_coords$SOFA)$p.value, format = "e", digits = 2),
+          sep="")
+  ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+```
+
+### 3. CRP levels
+SRSq scores are also associated with C reactive protein (CRP) levels.
+```{r plot_SRSq_vs_CRP, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=SRSq, y=crp_high)) +
+  geom_smooth(method="lm") +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("CRP levels (Z-scored)") +
+  ggtitle(
+     paste("\u03C1 = ", 
+          round(cor(pc_coords$SRSq, pc_coords$crp_high, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, pc_coords$crp_high)$p.value, format = "e", digits = 2),
+          sep="")
+  ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+```
+
+### 4. Lactate and bicarbonate levels
+The correlation beween SRSq and markers of tissue hypoxia and metabolic changes are as follows:
+```{r plot_SRSq_vs_lactate, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=SRSq, y=lactate_highest)) +
+  geom_smooth(method="lm") +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("Lactate levels (Z-scored)") +
+  ggtitle(
+     paste("\u03C1 = ", 
+          round(cor(pc_coords$SRSq, pc_coords$lactate_highest, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, pc_coords$lactate_highest)$p.value, format = "e", digits = 2),
+          sep="")
+  ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+
+ggplot(pc_coords, aes(x=SRSq, y=bicarbonate_lowest)) +
+  geom_smooth(method="lm") +
+   geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("Bicarbonate levels (Z-scored)") +
+  ggtitle(
+     paste("\u03C1 = ", 
+          round(cor(pc_coords$SRSq, pc_coords$bicarbonate_lowest, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, pc_coords$bicarbonate_lowest)$p.value, format = "e", digits = 2),
+          sep="")
+  ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+
+ggplot(pc_coords, aes(x=SRSq, y=LDH_admission)) +
+  geom_smooth(method="lm") +
+   geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("Lactate dehydrogenase at admission (Z-scored)") +
+  ggtitle(
+     paste("\u03C1 = ", 
+          round(cor(pc_coords$SRSq, pc_coords$LDH_admission, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, pc_coords$LDH_admission)$p.value, format = "e", digits = 2),
+          sep="")
+  ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+```
+
+### 5. Measurements of respiratory function
+The correlation beween SRSq and markers of tissue hypoxia and metabolic changes are as follows:
+```{r plot_SRSq_vs_FP_ratio, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=SRSq, y=(pc_coords$O2_FiO2_ratio*100 - 64)/0.84)) +
+  geom_smooth(method="lm") +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("PaO2/FiO2 ratio (mmHg)") +
+  ggtitle(
+     paste("\u03C1 = ", 
+          round(cor(pc_coords$SRSq, (pc_coords$O2_FiO2_ratio*100 - 64)/0.84, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, (pc_coords$O2_FiO2_ratio*100 - 64)/0.84)$p.value, format = "e", digits = 2),
+          sep="")
+  ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+```
+
+### 6. Length of stay in ICU
+There is also an association between SRSq and how long a patient stays in ICU.
+```{r plot_SRSq_vs_ICU_stay_duration, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=SRSq, y=Length_ICU_stay)) +
+  geom_smooth(method="lm") +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("Length of ICU stay (days)") +
+  ggtitle(
+     paste("\u03C1 = ", 
+          round(cor(pc_coords$SRSq, pc_coords$Length_ICU_stay, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, pc_coords$Length_ICU_stay)$p.value, format = "e", digits = 2),
+          sep="")
+  ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+```
+
+
+### 7. Cell counts
+Furthermore, there is an association with neutrophil and T cell counts in blood.
+```{r plot_SRSq_vs_cell_proportions, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(pc_coords, aes(x=SRSq, y=white_cell_count)) +
+  geom_smooth(method="lm", na.rm = T) +
+  geom_point(aes(color=SRS), size=3, na.rm=T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("Cell counts (Z-scored)") +
+  ggtitle(
+    paste("Total WBCs\n",
+          "Cor = ", 
+          round(cor(pc_coords$SRSq, pc_coords$white_cell_count, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, pc_coords$white_cell_count)$p.value, format = "e", digits = 2),
+          sep="")
+    ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+
+g2 <- ggplot(pc_coords, aes(x=SRSq, y=neutrophil_count)) +
+  geom_smooth(method="lm", na.rm = T) +
+  geom_point(aes(color=SRS), size=3, na.rm=T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("Cell counts (Z-scored)") +
+  ggtitle(
+    paste("Neutrophils\n",
+          "Cor = ", 
+          round(cor(pc_coords$SRSq, pc_coords$neutrophil_count, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, pc_coords$neutrophil_count)$p.value, format = "e", digits = 2),
+          sep="")
+    ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+
+g3 <- ggplot(pc_coords, aes(x=SRSq, y=lymphocyte_count)) +
+  geom_smooth(method="lm", na.rm = T) +
+  geom_point(aes(color=SRS), size=3, na.rm=T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ggtitle(
+    paste("Lymphocytes\n",
+          "Cor = ", 
+          round(cor(pc_coords$SRSq, pc_coords$lymphocyte_count, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, pc_coords$lymphocyte_count)$p.value, format = "e", digits = 2),
+          sep="")
+    ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+
+g4 <- ggplot(pc_coords, aes(x=SRSq, y=monocyte_count)) +
+  geom_smooth(method="lm", na.rm = T) +
+  geom_point(aes(color=SRS), size=3, na.rm=T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("Cell counts (Z-scored)") +
+  ggtitle(
+    paste("Monocytes\n",
+          "Cor = ", 
+          round(cor(pc_coords$SRSq, pc_coords$monocyte_count, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, pc_coords$monocyte_count)$p.value, format = "e", digits = 2),
+          sep="")
+    ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+
+g5 <- ggplot(pc_coords, aes(x=SRSq, y=platelet_count)) +
+  geom_smooth(method="lm", na.rm = T) +
+ geom_point(aes(color=SRS), size=3, na.rm=T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("Cell counts (Z-scored)") +
+ ggtitle(
+    paste("Platelets\n",
+          "Cor = ", 
+          round(cor(pc_coords$SRSq, pc_coords$platelet_count, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, pc_coords$platelet_count)$p.value, format = "e", digits = 2),
+          sep="")
+    ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+
+g6 <- ggplot(pc_coords, aes(x=SRSq, y=eosinophil_count)) +
+  geom_smooth(method="lm", na.rm = T) +
+  geom_point(aes(color=SRS), size=3, na.rm=T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("Cell counts (Z-scored)") +
+  ggtitle(
+    paste("Eosinophils\n",
+          "Cor = ", 
+          round(cor(pc_coords$SRSq, pc_coords$eosinophil_count, use = "complete.obs"),2),
+          "\np value = ",
+          formatC(cor.test(pc_coords$SRSq, pc_coords$eosinophil_count)$p.value, format = "e", digits = 2),
+          sep="")
+    ) +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+
+cowplot::plot_grid(g1,g2,g3,g4,g5,g6, ncol=3,nrow=2)
+```
+
+Lymphoid:myeloid ratio:
+```{r plot_pca_by_lymphoid_myeloid_ratio, message=FALSE, warning=FALSE, echo=FALSE}
+lymph <- (pc_coords$lymphocyte_count - min(pc_coords$lymphocyte_count, na.rm = T))/(max(pc_coords$lymphocyte_count, na.rm = T)-min(pc_coords$lymphocyte_count, na.rm = T))
+mono <- (pc_coords$monocyte_count - min(pc_coords$monocyte_count, na.rm = T))/(max(pc_coords$monocyte_count, na.rm = T)-min(pc_coords$monocyte_count, na.rm = T))
+neutro <- (pc_coords$neutrophil_count - min(pc_coords$neutrophil_count, na.rm = T))/(max(pc_coords$neutrophil_count, na.rm = T)-min(pc_coords$neutrophil_count, na.rm = T))
+eosino <- (pc_coords$eosinophil_count - min(pc_coords$eosinophil_count, na.rm = T))/(max(pc_coords$eosinophil_count, na.rm = T)-min(pc_coords$eosinophil_count, na.rm = T))
+
+combat_RNAseq$lymphoid_myeloid_ratio <- lymph/(mono+neutro+eosino)
+
+pc_coords$lymphoid_myeloid_ratio <- lymph/(mono+neutro+eosino)
+ggplot(pc_coords, aes(x=SRSq, y=lymphoid_myeloid_ratio)) +
+  geom_smooth(method="lm", na.rm = T) +
+  geom_point(aes(color=SRS), size=3, na.rm=T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("Cell counts (Z-scored)") +
+  ggtitle("Lymphoid:myeloid Ratio") +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust=0.5))
+```
+
+### 8. Mortality
+Preparing metadata for survival analysis
+```{r format_mortality_data, message=FALSE, warning=FALSE}
+combat_survdata <- as.tibble(colData(combat_RNAseq)[!is.na(combat_RNAseq$Length_of_hospital_stay),])
+combat_survdata <- combat_survdata %>% 
+  arrange(COMBAT_ID, -Timepoint) %>%
+  filter(!duplicated(COMBAT_ID))
+
+combat_survdata$age_bin <- ceiling(combat_survdata$Age/10)
+combat_survdata$SRS_rf_mnn <- factor(combat_survdata$SRS_rf_mnn, levels=c("SRS3","SRS2","SRS1"))
+```
+
+Censoring at 28 days
+```{r censor_mortality_data, warning=FALSE, message=FALSE}
+# Defining time to event and event variables
+combat_survdata$mortality_event_28d_censored <- combat_survdata$deceased
+combat_survdata$time_to_event_28d_censored <- combat_survdata$Length_of_hospital_stay
+
+# Censoring at 28 days
+combat_survdata$mortality_event_28d_censored[combat_survdata$time_to_event_28d_censored > 28] <- 0
+combat_survdata$time_to_event_28d_censored[combat_survdata$time_to_event_28d_censored > 28] <- 28
+combat_survdata$time_to_event_28d_censored[combat_survdata$mortality_event_28d_censored == 0] <- 28
+```
+
+
+The 28 day-survival by group looks as follows.
+```{r plot_survival_curve_by_SRS_combat, message=FALSE, warning=FALSE}
+ggsurvplot(
+  fit = survfit(Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SRS,
+                data=combat_survdata),
+  xlab = "Days since hospital admission", 
+  ylab = "Survival probability",
+  xlim = c(0,29),
+  title = "28-day survival",
+  conf.int = T, 
+  pval = T,
+  palette = c("darkred","steelblue", "darkblue"), 
+  legend.labs = c("SRS1", "SRS2","SRS3"),
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+```
+
+Let's now perform a sliding window analysis of survival along the SRSq variable.
+```{r perform_sliding_window_analysis, message=FALSE, warning=FALSE}
+vars_of_interest <- c("time_to_event_28d_censored", "mortality_event_28d_censored" ,"SRSq")
+combat_roll <- combat_survdata[!is.na(combat_survdata$SRSq),vars_of_interest]
+combat_roll <- combat_roll[order(combat_roll$SRSq),]
+
+window_width <- round(nrow(combat_roll)*0.35)
+
+rolling_survival_combat <- rollapply(combat_roll, width=window_width, FUN = function(dat){
+  
+  dat <- data.frame(dat)
+  
+  median_SRSq <- median(dat[,"SRSq"])
+  
+  surv_res <- summary(survfit(Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ 1,
+                             data=dat), times=28)
+  mean_surv <- surv_res$surv
+  surv_upper <- surv_res$upper
+  surv_lower <- surv_res$lower
+  
+  res <- cbind(median_SRSq, surv_lower, mean_surv, surv_upper)
+  return(res)
+  
+  },
+  
+  by.column = F)
+
+rolling_survival_combat <- data.frame(rolling_survival_combat)
+```
+
+There is an increase in 28-day mortality associated with higher SRSq scores.
+```{r plot_mortality_by_SRSq}
+ggplot(rolling_survival_combat, aes(x=median_SRSq, y=1-mean_surv)) +
+  geom_errorbar(aes(ymin=1-surv_lower, ymax=1-surv_upper), colour="lightgrey") +
+  geom_point() +
+  xlab("Median SRSq") +
+  ylab("28-day Mortality") +
+  ylim(0,0.7) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5))
+```
+
+
+In order to test if the association between SRSq and mortality is statistically significant, we model this relationship using a Cox Proportional Hazard's model. We also fit Cox models for a variety of clinicla variables which might have an impact on mortality.
+```{r fit_cox_models, message=FALSE, warning=FALSE}
+# Brining SRSq to the [0-10] range so as to make the HR estimates comparable to SOFA and SRS
+combat_survdata$SRSq_adj <- 10*combat_survdata$SRSq
+combat_survdata$lymphoid_myeloid_ratio_adj <- 10*combat_survdata$lymphoid_myeloid_ratio
+
+SRSq_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SRSq_adj, 
+  data = combat_survdata
+  ))
+SOFA_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SOFA, 
+  data = combat_survdata
+  ))
+CRP_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ crp_high, 
+  data = combat_survdata
+  ))
+lactate_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ lactate_highest, 
+  data = combat_survdata
+  ))
+O2_FiO2_ratio_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ O2_FiO2_ratio, 
+  data = combat_survdata
+  ))
+lymphoid_myeloid_ratio_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ lymphoid_myeloid_ratio_adj, 
+  data = combat_survdata
+  ))
+
+cox_univariate_microarray <- data.frame(
+  variable = c("SRSq (per 0.1 unit increase)","SOFA score (per unit increase)", "CRP (per unit increase)","Peak lactate levels (per unit increase)", "O2/FiO2 ratio", "Lymphoid:myeloid ratio"),
+  HR = c(SRSq_cox$conf.int[1],
+         SOFA_cox$conf.int[1],
+         CRP_cox$conf.int[1],
+         lactate_cox$conf.int[1],
+         O2_FiO2_ratio_cox$conf.int[1],
+         lymphoid_myeloid_ratio_cox$conf.int[1]),
+  HR_lower = c(SRSq_cox$conf.int[3],
+               SOFA_cox$conf.int[3],
+               CRP_cox$conf.int[3],
+               lactate_cox$conf.int[3],
+               O2_FiO2_ratio_cox$conf.int[3],
+               lymphoid_myeloid_ratio_cox$conf.int[3]),
+  HR_upper = c( SRSq_cox$conf.int[4],
+               SOFA_cox$conf.int[4],
+               CRP_cox$conf.int[4],
+               lactate_cox$conf.int[4],
+               O2_FiO2_ratio_cox$conf.int[4],
+               lymphoid_myeloid_ratio_cox$conf.int[4]),
+  pval = c(SRSq_cox$logtest["pvalue"],
+           SOFA_cox$logtest["pvalue"],
+           CRP_cox$logtest["pvalue"],
+           lactate_cox$logtest["pvalue"],
+           O2_FiO2_ratio_cox$logtest["pvalue"],
+           lymphoid_myeloid_ratio_cox$logtest["pvalue"])
+)
+
+cox_univariate_microarray
+```
+
+We now build a multivariate model which tests the association between SRSq and mortality, while accounting for age and type of sepsis. We do not include SOFA scores, F/P ratios or CRP levels here, as they can potentially be tagging a mediation path, and would thus eliminate or weaken the SRSq-mortality association. The results are as follows:
+```{r fit_multivariate_cox_model_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+SRSq_cox_multivariate <- coxph(Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SRSq_adj + age_bin,
+            data = combat_survdata)
+ggforest(SRSq_cox_multivariate)
+
+SRSq_cox_multivariate <- coxph(Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SRSq_adj + age_bin + lymphoid_myeloid_ratio_adj,
+            data = combat_survdata)
+ggforest(SRSq_cox_multivariate)
+```
+
+## Disentangling the mechanisms linking SRS and mortality
+### In COVID-19
+#### A) Dissecting the role of organ dysfunction (total SOFA scores)
+```{r model_mediator_variable_SOFA, message=FALSE, warning=FALSE}
+mediator_fit <- lm(SOFA ~ SRSq_adj + age_bin, 
+                   data = combat_survdata)
+summary(mediator_fit)
+```
+
+
+```{r model_outcome_variable_SOFA, message=FALSE, warning=FALSE}
+outcome_fit <- glm(mortality_event_28d_censored ~ SRSq_adj + SOFA + age_bin, 
+                   family = binomial(link="probit"), 
+                   data = combat_survdata)
+
+summary(outcome_fit)
+```
+
+```{r estimate_causal_effects_SOFA, message=FALSE, warning=FALSE}
+mediation_res <- mediate(mediator_fit, outcome_fit, 
+                         treat = "SRSq_adj", 
+                         mediator = "SOFA", 
+                         sims = 1000, 
+                         treat.value = median(combat_survdata$SRSq_adj[combat_survdata$SRS=="SRS1"]), 
+                         control.value = median(combat_survdata$SRSq_adj[combat_survdata$SRS=="SRS2"]))
+
+```
+
+The estimated causal effects are as follows for the microarray cohort:
+```{r print_causal_effects_SOFA, message=FALSE, warning=FALSE, echo=FALSE}
+summary(mediation_res)
+```
+
+
+```{r plot_causal_effects_SOFA, message=FALSE, warning=FALSE, echo=FALSE}
+plot(mediation_res, main="COMBAT cohort", xlab="Estimated effect size")
+```
+
+#### B) Dissecting the role of lung dysfunction (P/F ratio)
+We define a PaO2/FiO2 (P/F) ratio based on the measured SpO2/FiO2 ratio and the equation described by Rice et al., 2007.
+```{r define_PF_ratio, message=FALSE, warning=FALSE}
+combat_survdata$PF_ratio <- (combat_survdata$O2_FiO2_ratio*100 - 64)/0.84
+```
+
+We then continue with the mediation analysis using this variable.
+```{r model_mediator_variable_PF_ratio, message=FALSE, warning=FALSE}
+mediator_fit <- lm(PF_ratio ~ SRSq_adj + age_bin, 
+                   data = combat_survdata)
+summary(mediator_fit)
+```
+
+
+```{r model_outcome_variable_PF_ratio, message=FALSE, warning=FALSE}
+outcome_fit <- glm(mortality_event_28d_censored ~ SRSq_adj + PF_ratio + age_bin, 
+                   family = binomial(link="probit"), 
+                   data = combat_survdata)
+
+summary(outcome_fit)
+```
+
+
+```{r estimate_causal_effects_PF_ratio, message=FALSE, warning=FALSE}
+mediation_res <- mediate(mediator_fit, outcome_fit, 
+                         treat = "SRSq_adj", 
+                         mediator = "PF_ratio", 
+                         sims = 1000, 
+                         treat.value = median(combat_survdata$SRSq_adj[combat_survdata$SRS=="SRS1"]), 
+                         control.value = median(combat_survdata$SRSq_adj[combat_survdata$SRS=="SRS2"]))
+
+```
+
+The estimated causal effects are as follows for the microarray cohort:
+```{r print_causal_effects_FP_ratio, message=FALSE, warning=FALSE, echo=FALSE}
+summary(mediation_res)
+```
+
+
+```{r plot_causal_effects_PF_ratio, message=FALSE, warning=FALSE, echo=FALSE}
+plot(mediation_res, main="COMBAT cohort", xlab="Estimated effect size")
+```
+
+In conclusion:
+```{r plot_proportion_explained_by_PF_ratio, message=FALSE, warning=FALSE, echo=FALSE}
+cat("Proportion of the effect of SRSq on mortality mediated by lung dysfunction: ",
+    round(mediation_res$n.avg*100,2), "%", sep="")
+```
+
+## Saving predictions
+Exporting SRS and SRSq predictions as a tab-separated file
+```{r export_predictions, eval=FALSE}
+COMBAT_SRS_predictions <- data.frame(colData(combat_RNAseq)[,c("RNASeq_sample_ID","COMBAT_ID","SRS","SRSq")])
+colnames(COMBAT_SRS_predictions) <- c("Sample_ID","COMBAT_ID","SRS","SRSq")
+COMBAT_SRS_predictions$SRSq <- round(COMBAT_SRS_predictions$SRSq,4)
+
+write.table(COMBAT_SRS_predictions,
+            "../results/classifier_predictions/COMBAT-SRS-predictions_COVID-only_extended-gene-set_mNN-RF.tsv", 
+            quote = F, 
+            row.names = F, 
+            sep = "\t")
+```
+
+
+## R session
+```{r session_info, message=FALSE, warning=FALSE}
+sessionInfo()
+```
+
+

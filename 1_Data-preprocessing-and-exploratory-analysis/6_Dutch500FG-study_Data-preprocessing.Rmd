@@ -1,0 +1,115 @@
+---
+title: "Exploratory data analysis of a whole blood RNA-seq data set of healthy individuals"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This markdown contains simple pre-processing and exploratory data analysis of a publicly available RNA-seq data set of whole blood from healthy individuals of Dutch ancestry. RNA-seq was performed using the TruSeq protocol (i.e. polyA-based method) and globin transcripts were removed computationally. For more details on the generation and processing of this data set, refer to Aguirre-Gamboa et al, 2020; BMC Bioinformatics:
+
+https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-020-03576-5#Sec11
+
+## Loading libraries
+```{r load_libraries, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(SummarizedExperiment)
+library(annotables)
+```
+
+## Loading data
+Loading expression matrix with raw counts measured using RNA-sequencing.
+```{r load_dutch500FG_data, message=FALSE, warning=FALSE}
+dutch500FG_gex <- read.csv("../data/Aguirre-Gamboa-et-al_2020_BMC-bioinformatics/GSE134080_500FG_RNASeq_counts.txt.gz", 
+                           header=T, row.names = 1)
+```
+
+## Adding gene annotations
+Only keeping genes with Ensembl annotations.
+```{r subset_to_annotated_genes, message=FALSE, warning=FALSE}
+annotated_genes <- intersect(grch38$ensgene, rownames(dutch500FG_gex))
+dutch500FG_gex <- dutch500FG_gex[annotated_genes,]
+```
+
+Fetching Ensembl gene annotations using the annotables package.
+```{r fetch_gene_annotations, message=FALSE, warning=FALSE}
+gene_annotations <- data.frame(
+  grch38 %>% 
+    filter(ensgene %in% annotated_genes) %>%
+    filter(!duplicated(ensgene)) %>%
+    transmute(gene_id = ensgene,
+              gene_name = symbol,
+              chr = chr,
+              start = start,
+              end = end,
+              biotype = biotype)
+  )
+rownames(gene_annotations) <- gene_annotations$gene_id
+gene_annotations <- gene_annotations[rownames(dutch500FG_gex),]
+```
+
+## Data transformation and normalization
+Performing CPM normalization.
+```{r cpm_normalize, message=FALSE, warning=FALSE}
+dutch500FG_gex <- (dutch500FG_gex*1e6)/colSums(dutch500FG_gex)
+```
+
+Applying a log2-transformation.
+```{r log_transform, message=FALSE, warning=FALSE}
+dutch500FG_gex <- log2(dutch500FG_gex + 1)
+```
+
+## Creating Summarized Experiment
+Creating a SummarizedExperiment object with log2-cpm values and gene annotations.
+```{r create_summarized_experiment, message=FALSE, warning=FALSE}
+dutch500FG <- SummarizedExperiment(assays = dutch500FG_gex, rowData = gene_annotations)
+```
+
+## Gene filtering
+Keeping only genes with at least 1 CPM in at least 10 samples.
+```{r filter_genes, message=FALSE, warning=FALSE}
+dutch500FG <- dutch500FG[rowSums(assay(dutch500FG) > 1) > 10,]
+```
+
+## Dimensionality reduction and visualisation
+Performing PCA on all genes.
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca_dutch500FG <- prcomp(t(assay(dutch500FG)))
+```
+
+Retrieving PCA coordinates and variance explained by each component.
+```{r fetch_pc_coords, message=FALSE, warning=FALSE}
+pc_coords_dutch500FG <- data.frame(pca_dutch500FG$x)
+pc_variance_dutch500FG <- pca_dutch500FG$sdev^2/sum(pca_dutch500FG$sdev^2)
+```
+
+There is little variance in this data set, suggesting a very homogeneous set of individuals. Most of the variance is explained by the first principal component.
+```{r plot_variance_explained_per_pc, message=FALSE, warning=FALSE, echo=FALSE}
+plot(pc_variance_dutch500FG[1:50], 
+     type="b", cex=0.5, 
+     xlab="Principal Component", 
+     ylab="Proportion of variance explained")
+```
+
+Samples look as follows in PCA space
+```{r plot_pca, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords_dutch500FG, aes(x=PC1, y=PC2)) +
+  geom_point() +
+  theme_classic()
+```
+
+## Exporting object as RDS file
+The SummarizedExperiment object for this data is exported as an R data set.
+```{r export_object, eval=FALSE}
+saveRDS(dutch500FG, "../data/Aguirre-Gamboa-et-al_2020_BMC-bioinformatics/dutch500FG_RNA-seq_log2-cpm.rds")
+```
+
+## R session details
+```{r r_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```
+
+  

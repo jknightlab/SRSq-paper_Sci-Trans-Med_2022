@@ -1,0 +1,728 @@
+---
+title: "Exploratory analysis of GAinS RNA-seq data"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This markdown document contains a general exploratory analysis of the full RNA-seq data for the GAinS consortium. This data was previously processed by the group, which included alignment to the human genome using STAR, quality filtering by removing low quality samples and PCA outliers, correction of any sample swaps, and filtering of features with less than 10 reads in at least 5% of the cohort. Gene expression measurements are stored as log2-CPMs.
+
+## Loading libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(SummarizedExperiment)
+library(umap)
+library(ggrepel)
+library(pheatmap)
+library(corrplot)
+library(ROCR)
+```
+
+## Loading microarray data
+Reading the following files:
+
+1. Log2-CPM expression matrix
+```{r load_expression_matrix, message=FALSE, warning=FALSE}
+gains_expression <- read.table("/well/jknight/Sepsis/Gene_Expression/RNASeq/Logcpm_864_20416.txt",
+                               sep = "\t",
+                               header = T, 
+                               row.names = 1)
+```
+
+2. SRS information and some metadata for the GAinS RNA-seq cohort, as well as some additional clinical data for a subset of the samples
+```{r load_SRS_mappings, message=FALSE, warning=FALSE}
+srs_mappings <- read.table("/well/jknight/Sepsis/Gene_Expression/RNASeq/s.info.864_all_samples_assigned_SRS.txt",
+                          sep = "\t",
+                          header = T)
+```
+
+```{r load_clinical_data, message=FALSE, warning=FALSE}
+samples_clinical_data <- read.table("/well/jknight/Sepsis/Gene_Expression/GAinS_full_dataset_sample_information.txt",
+                                sep = "\t",
+                                header = T)
+```
+
+3. Gene annotations
+```{r load_gene_info, message=FALSE, warning=FALSE}
+gene_annotations <- read.table("/well/jknight/Sepsis/Gene_Expression/RNASeq/Gene_info_864_20416.txt",
+                               sep = "\t",
+                               header = T)
+```
+
+## Formatting data
+### Matching expression matrix to gene information
+Making sure matrix row names match gene names in the probe information table
+```{r match_gene_names, message=FALSE, warning=FALSE}
+gene_annotations <- gene_annotations[,c("gene_id","gene_name","gene_biotype","seqnames","start","end","strand")]
+colnames(gene_annotations)[4] <- "chromosome"
+
+rownames(gene_annotations) <- gene_annotations$gene_id
+mean(rownames(gains_expression) == rownames(gene_annotations))
+```
+
+### Matching expression table to sample information
+Building table with sample annotations
+```{r build_coldata, message=FALSE, warning=FALSE}
+sample_annotations <- srs_mappings
+rownames(sample_annotations) <- sample_annotations$SampleID
+
+sample_annotations$Day <- as.integer(gsub("^.*_","",colnames(gains_expression)))
+sample_annotations$Age <- NA
+sample_annotations$Sex <- NA
+sample_annotations$Diagnosis <- NA
+sample_annotations$DaystoDeath <- NA
+
+rownames(samples_clinical_data) <- samples_clinical_data$SampleID
+sample_annotations[intersect(sample_annotations$SampleID, samples_clinical_data$SampleID),
+                   c("Age","Sex","Diagnosis","DaystoDeath")] <-
+  samples_clinical_data[intersect(sample_annotations$SampleID, samples_clinical_data$SampleID),
+                      c("Age","Sex","Diagnosis","DaystoDeath")]
+
+head(sample_annotations)
+```
+Making sure matrix column names match sample IDs in the sample information table
+```{r match_sample_ids, message=FALSE, warning=FALSE}
+mean(colnames(gains_expression) == rownames(sample_annotations))
+```
+
+### Creating summarised experiment
+Defining a summarized experiment object which contains both expression measurements and metadata (for samples and genes)
+```{r create_summarized_experiment}
+gains_RNAseq <- SummarizedExperiment(assays = gains_expression,
+                                     colData = sample_annotations, 
+                                     rowData = gene_annotations)
+```
+
+```{r clean_RAM, message=FALSE, warning=FALSE, echo=FALSE}
+## Removing unnecessary variables from the environment
+rm(gains_expression, sample_annotations, gene_annotations, samples_clinical_data, srs_mappings)
+```
+
+## Saving summarised experiment
+Exporting summarised experiment object as an R data set
+```{r save_rds, message=FALSE, warning=FALSE, eval=FALSE}
+saveRDS(gains_RNAseq, file="/well/jknight/eddie/consensus_endotyping/data/gains_full_RNAseq_norm_log2-cpm.rds")
+```
+
+## Exploring data
+### Checking for heteroskedasticity
+Verifying whether there is any heteroskedasticity left after the previous normalization and batch correction steps
+```{r estimate_gene_variances, message=FALSE, warning=FALSE}
+# Estimating gene variances
+gene_variances <- data.frame(mean_expression = rowMeans(assay(gains_RNAseq)),
+                             variance = rowVars(as.matrix(assay(gains_RNAseq))))
+
+# Identifying most variable genes
+gene_variances <- gene_variances[order(-gene_variances$variance),]
+gene_variances$rank <- 1:nrow(gene_variances)
+gene_variances$top_variable <- FALSE
+gene_variances$top_variable[1:1000] <- TRUE
+gene_variances <- gene_variances[rownames(gains_RNAseq),]
+```
+
+A simple visual inspection reveals no relationship between expression level and expression variance
+```{r plot_mean_vs_variance, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(gene_variances, aes(x=mean_expression, y=variance)) + 
+  geom_point(aes(color=top_variable), size=0.75) +
+  scale_color_manual(values=c("#8da0cb","#fc8d62")) +
+  xlab("Mean expression") +
+  ylab("Variance in expression") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+### Principal component analysis (PCA)
+Performing PCA based on the all genes
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca <- prcomp(t(assay(gains_RNAseq)))   
+
+pc_coords <- data.frame(cbind(pca$x,colData(gains_RNAseq)))
+pc_variance <- pca$sdev^2/sum(pca$sdev^2)
+```
+
+We see a separation of day at which samples were collected
+```{r plot_pca_by_day, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(Day)), size=3) +
+  scale_color_manual(values = c("#a1dab4","#41b6c4","#225ea8"), name="Day") +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+For the samples in this RNA-seq dataset, 133 were also profiled using microarrays in the original GAinS paper. If we visualise the SRS group of these samples (as originally defined in the publication), we see that the main separation (along PC1) in the RNA-seq is also by SRS group.
+```{r plot_pca_by_unsupervised_SRS, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords[is.na(pc_coords$SRSUnsup),], aes(x=PC1, y=PC2)) + 
+  geom_point(color="lightgrey", size=3) +
+  geom_point(data=pc_coords[!is.na(pc_coords$SRSUnsup),], aes(color=as.factor(SRSUnsup)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), name="Endotype", labels=c("SRS1","SRS2")) +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  ggtitle("SRS assignments based on unsupervised clustering of microarray data") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(size=12, hjust=0.5))
+```
+The plot below highlights a subset of 8 samples for which the classifier disagreed with the original SRS group assignment. We see that these are all located at the boundaries between SRS groups.
+```{r plot_pca_by_snsupervised_SRS_plus_mismatches, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords[is.na(pc_coords$SRSUnsup),], aes(x=PC1, y=PC2)) + 
+  geom_point(color="lightgrey", size=3) +
+  geom_point(data=pc_coords[!is.na(pc_coords$SRSUnsup),], aes(color=as.factor(SRSUnsup)), size=3) +
+  geom_point(data=pc_coords[is.na(pc_coords$SRSModel),], color="darkred", size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), name="Endotype", labels=c("SRS1","SRS2")) +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  ggtitle("SRS assignments based on unsupervised clustering of microarray data") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(size=12, hjust=0.5))
+```
+We now colour the samples by their SRS group, as previously assigned to them using the logistic regression built by Emma and Katie.
+```{r plot_pca_by_predicted_SRS, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(SRSModel)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), name="Endotype", labels=c("SRS1","SRS2")) +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  ggtitle("SRS assignments based on Katie's RNA-seq re-trained classifier") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(size=12, hjust=0.5))
+```
+Since PC1 separates SRS endotypes so well, we explore which genes contribute the most to this component.
+```{r get_PC_loadings, message=FALSE, warning=FALSE}
+# Extracting loadings for the first 10 PCs
+pc_loadings <- data.frame(gene = rowData(gains_RNAseq)[rownames(pca$rotation),]$gene_name,
+                           pca$rotation[,1:10])
+```
+
+```{r plot_pc1_loadings, message=FALSE, warning=FALSE, echo=FALSE}
+pc1_loadings <- pc_loadings[order(pc_loadings$PC1),]
+pc1_loadings$gene_rank <- 1:nrow(pc1_loadings)
+
+ggplot(pc1_loadings, aes(x=gene_rank, y=PC1)) + 
+  geom_point() +
+  geom_label_repel(data=pc1_loadings[1:20,], aes(x=gene_rank, y=PC1, label=gene), size=3) +
+  geom_label_repel(data=pc1_loadings[(nrow(pc1_loadings)-20):nrow(pc1_loadings),], 
+                   aes(x=gene_rank, y=PC1, label=gene), size=3) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+The plot below shows the PC1 loadings for all 7 genes in the SRS signature which were detected in this dataset.
+```{r define_srs_genes, message=FALSE, warning=FALSE}
+SRS_genes <- c("ARL14EP","CCNB1IP1","DYRK2","ADGRE3","MDC1","TDRD9","ZAP70")
+```
+
+```{r plot_pc1_loadings_of_classifier_genes, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank, y=PC1)) + 
+  geom_point() +
+  geom_point(data=pc1_loadings[pc1_loadings$gene %in% SRS_genes,],
+             aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkred") +
+  geom_label_repel(data=pc1_loadings[pc1_loadings$gene %in% SRS_genes,],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkred") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+Shown below are also the PC1 loadings of eight genes highlighted as differentially expressed between SRS1 and SRS2 in the original GAinS paper.
+```{r plot_pc1_loadings_of_DE_genes, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank, y=PC1)) + 
+  geom_point() +
+  geom_point(data=pc1_loadings[pc1_loadings$gene %in% c("ANKS1A"),],
+             aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkred") +
+  geom_point(data=pc1_loadings[pc1_loadings$gene %in% c("SLC25A38","RSAD1","LY9","ZNHIT6","TSEN554","ABHD14A","WDR74"),],
+             aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  geom_label_repel(data=pc1_loadings[pc1_loadings$gene %in% c("ANKS1A"),],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkred") +
+  geom_label_repel(data=pc1_loadings[pc1_loadings$gene %in% c("SLC25A38","RSAD1","LY9","ZNHIT6","TSEN54","ABHD14A","WDR74"),],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+I further tested if any of the "T cell effectorness genes" identified throughout my PhD were enriched in the extremes of PC1 loadings.
+
+```{r load_effectorness_genes, message=FALSE, warning=FALSE}
+effectorness_genes <- read_tsv("/well/jknight/eddie/resources/effectornessGenes_restingTcells_phase1.txt")
+```
+
+```{r plot_pc1_loadings_of_effectorness_genes, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank, y=PC1)) + 
+  geom_point() +
+  geom_point(data=pc1_loadings[pc1_loadings$gene %in% effectorness_genes$gene_name,],
+             aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  geom_label_repel(data=pc1_loadings[pc1_loadings$gene %in% effectorness_genes$gene_name & pc1_loadings$gene_rank > nrow(pc1_loadings) - 300,],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  geom_label_repel(data=pc1_loadings[pc1_loadings$gene %in% effectorness_genes$gene_name & pc1_loadings$gene_rank < 300,],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+```{r plot_effectorness_genes_rank_density, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank)) + 
+  geom_density() +
+  geom_density(data=pc1_loadings[pc1_loadings$gene %in% effectorness_genes$gene_name,],
+             aes(x=gene_rank), color="darkblue") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+### Uniform Manifold Approximation and Projection (UMAP)
+However, there might be more than one principal component capturing relevant variation. Thus, we estimate the proportion of variance explained by each component.
+
+This plot reveals that all of the first 15 PCs explain more than 1% of the variance.
+```{r plot_variance_explained_by_pcs, message=FALSE, warning=FALSE, echo=FALSE}
+pc_variance <- pca$sdev^2/sum(pca$sdev^2)
+plot(pc_variance[1:50], type="b", cex=0.5, xlab="Principal Component", ylab="Proportion of variance explained")
+abline(h = 0.01)
+```
+
+Thus, we take the first 15 PCs and embed them into a 2-dimensional space using the UMAP algorithm.
+```{r perform_umap, message=FALSE, warning=FALSE}
+umap_res <- umap(pc_coords[,1:10])
+umap_coords <- data.frame(umap_res$layout)
+colnames(umap_coords) <- c("UMAP1","UMAP2")
+
+umap_coords <- cbind(umap_coords, colData(gains_RNAseq))
+```
+
+It seems that by taking a much larger proportion of the variation into account, UMAP ends up separating the samples by time point rather.
+```{r plot_umap_by_day, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(umap_coords, aes(x=UMAP1, y=UMAP2)) + 
+  geom_point(aes(color=as.factor(Day)), size=3) +
+  scale_color_manual(values = c("#a1dab4","#41b6c4","#225ea8"), name="Day") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+This, however, still correlates with SRS membership due to the inevitable sampling bias in the clinic.
+```{r plot_umap_by_predicted_SRS, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(umap_coords, aes(x=UMAP1, y=UMAP2)) + 
+  geom_point(aes(color=as.factor(SRSModel)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), na.value="lightgrey", name="Predicted endotype", labels=c("SRS1","SRS2")) +
+  ggtitle("SRS assignments based on Emma's classifier") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(size=12, hjust=0.5))
+```
+
+## Assessing correlation between microarray and RNA-seq measurements
+Loading microarray data
+```{r load_microarray, message=FALSE, warning=FALSE}
+gains_microarray <- readRDS("/well/jknight/eddie/consensus_endotyping/data/gains_full_microarray_dedup_norm_combat_average-per-gene.rds")
+```
+
+Making sure the microarray data looks as it should
+```{r perform_pca_microarray, message=FALSE, warning=FALSE}
+pca_microarray <- prcomp(t(assay(gains_microarray)))   
+
+pc_coords_microarray <- data.frame(cbind(pca_microarray$x,colData(gains_microarray)))
+pc_variance_microarray <- pca_microarray$sdev^2/sum(pca_microarray$sdev^2)
+```
+
+```{r plot_pca_by_unsupervised_srs_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords_microarray, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(SRS)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), na.value="lightgrey", name="Endotype", labels=c("SRS1","SRS2")) +
+  xlab(paste("PC1 (", round(pc_variance_microarray[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance_microarray[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Only keeping genes which are also detected in the RNA-seq data
+```{r keep_shared_genes, message=FALSE, warning=FALSE}
+gains_microarray <- gains_microarray[rowData(gains_microarray)$Ensembl_ID %in% rownames(gains_RNAseq),]
+gains_microarray <- gains_microarray[!duplicated(rowData(gains_microarray)$Ensembl_ID),]
+rownames(gains_microarray) <- rowData(gains_microarray)$Ensembl_ID
+```
+
+Estimating correlation between microarray and RNA-seq data for the 133 samples present in both data sets. We do this at the level of:
+
+1) Sample-wise correlations:
+```{r calculate_sample_correlations, message=FALSE, warning=FALSE}
+shared_samples <- intersect(colnames(gains_microarray), colnames(gains_RNAseq))
+sample_wise_correlations <- sapply(shared_samples, FUN=function(i){
+  microarray <- assay(gains_microarray[,i])[,1]
+  RNAseq <- assay(gains_RNAseq[rownames(gains_microarray),i])[,1]
+  
+  correlation <- cor(microarray, RNAseq)
+  return(correlation)
+  
+})
+```
+
+2) Gene-wise correlations:
+```{r calculate_gene_correlations, message=FALSE, warning=FALSE}
+gene_wise_correlations <- sapply(rownames(gains_microarray), FUN=function(i){
+  microarray <- as.numeric(assay(gains_microarray[i,shared_samples]))
+  RNAseq <- as.numeric(assay(gains_RNAseq[i,shared_samples]))
+  
+  correlation <- cor(microarray, RNAseq)
+  return(correlation)
+  
+})
+```
+
+The plots below indicate that, while sample-wise correlations are very high (close to 0.7 on average), gene-wise correlations span a large range and form a bimodal distribution, whith the majority of genes showing high correlation (~0.7 on average) and a subgroup showing no correlation between technologies (peak centred at zero).
+
+This suggests that while most features correlated well between platforms, there is a subset of features which capture platform-specific variation.
+```{r plot_correlations, message=FALSE, warning=FALSE, echo=FALSE}
+hist(sample_wise_correlations, breaks=20, main="Sample-wise correlation between microarray and RNA-seq", xlab="Pearson correlation", xlim=c(0.5,1))
+hist(gene_wise_correlations, breaks=100, main="Gene-wise correlation between microarray and RNA-seq", xlab="Pearson correlation")
+```
+To understand this in more depth, we now visualise the best and worst correlated genes between platforms.
+
+1) Top 10 most correlated genes:
+```{r plot_top_correlated_genes, message=FALSE, warning=FALSE, echo=FALSE}
+gene_wise_correlations <- gene_wise_correlations[order(-gene_wise_correlations)]
+
+for(gene in names(gene_wise_correlations)[1:10]){
+  print(
+    plot(as.numeric(assay(gains_RNAseq)[gene,shared_samples]),
+     as.numeric(assay(gains_microarray)[gene,shared_samples]),
+     xlab="RNA-seq expression [ log2(CPM + 1) ]",
+     ylab="Microarray expression",
+     main=rowData(gains_RNAseq)[gene,]$gene_name)
+  )
+}
+```
+
+2) Bottom 10 worst correlated genes:
+```{r plot_bottom_correlated_genes, message=FALSE, warning=FALSE, echo=FALSE}
+gene_wise_correlations <- gene_wise_correlations[order(gene_wise_correlations)]
+
+for(gene in names(gene_wise_correlations)[1:10]){
+  print(
+    plot(as.numeric(assay(gains_RNAseq)[gene,shared_samples]),
+     as.numeric(assay(gains_microarray)[gene,shared_samples]),
+     xlab="RNA-seq expression [ log2(CPM + 1) ]",
+     ylab="Microarray expression",
+     main=rowData(gains_RNAseq)[gene,]$gene_name)
+  )
+}
+
+```
+
+We see that, indeed, some genes do not correlate well across platforms and can even show apparent negative correlations, which is very puzzling. Most of these, however, are driven by genes with a very narrow expressionr ange and could be driven by random variation. These genes are certainly not good predictor candidates, but the top correlated ones look good.
+
+
+We now turn our attention to the 7 genes used to classify SRS endotypes in Emma's paper. They tend to correlated relatively well between the two platforms.
+```{r plot_SRS_genes_correlation, message=FALSE, warning=FALSE, echo=FALSE}
+for(gene_name in SRS_genes){
+  gene <- rowData(gains_RNAseq)$gene_id[rowData(gains_RNAseq)$gene_name %in% gene_name]
+  print(
+    plot(as.numeric(assay(gains_RNAseq)[gene,shared_samples]),
+     as.numeric(assay(gains_microarray)[gene,shared_samples]),
+     xlab="RNA-seq expression [ log2(CPM + 1) ]",
+     ylab="Microarray expression",
+     xlim=c(0,12),
+     ylim=c(0,12),
+     main=paste(gene_name,"\nCor=",round(gene_wise_correlations[gene],2)))
+  )
+  print(abline(h=0, col="grey"))
+  print(abline(v=0, col="grey"))
+  print(abline(a=0,b=1, col="red"))
+}
+
+```
+
+However, we get to see that the range of measured expression differs substantially between the two technologies. This will in turn affect the results from any regression model if it is based on 'raw' expression measurements. In contrast, one would expect ratios between genes to be more stable. Thus, we explore this next.
+
+## Correlation of gene ratios
+We start by fetching the Ensembl IDs for the 7 signature SRS genes and then extracting the irexpression measurements from the micruarray and RNA-seq data sets.
+```{r get_srs_genes_ids, message=FALSE, warning=FALSE}
+SRS_gene_ids <- rowData(gains_RNAseq)$gene_id[rowData(gains_RNAseq)$gene_name %in% SRS_genes]
+```
+
+```{r extract_srs_genes, message=FALSE, warning=FALSE}
+# Microarray
+SRS_genes_microarray <- data.frame(t(assay(gains_microarray)[SRS_gene_ids,]))
+colnames(SRS_genes_microarray) <- rowData(gains_RNAseq)[colnames(SRS_genes_microarray),]$gene_name
+
+# RNA-seq
+SRS_genes_RNAseq <- data.frame(t(assay(gains_RNAseq)[SRS_gene_ids,]))
+colnames(SRS_genes_RNAseq) <- rowData(gains_RNAseq)[colnames(SRS_genes_RNAseq),]$gene_name
+```
+
+Based on this values, we can now calcualte gene ratios between the 7 candidate predictors.
+
+### Log-ratios based on 'raw' expression values
+We start by simply calculating the log2-ratio of all SRS signature genes to TDRD9, based on the 'raw' microarray and RNA-seq expression measurements. This is because the expression pattern of TDRD9 goes in the opposite direction to that of the other 6 genes in Emma's classifier. Note how we apply a log2 transformation so as to make the ratios symmetric.
+```{r calculate_microarray_raw, message=FALSE, warning=FALSE}
+# Microarray
+SRS_gene_ratios_microarray <- data.frame(log2(SRS_genes_microarray[,1:6]/SRS_genes_microarray$TDRD9))
+colnames(SRS_gene_ratios_microarray)[1:6] <- paste(colnames(SRS_gene_ratios_microarray)[1:6], ":TDRD9", sep="")
+
+# RNA-seq
+SRS_gene_ratios_RNAseq <- data.frame(log2(SRS_genes_RNAseq[,1:6]/SRS_genes_RNAseq$TDRD9))
+colnames(SRS_gene_ratios_RNAseq)[1:6] <- paste(colnames(SRS_gene_ratios_RNAseq)[1:6], ":TDRD9", sep="")
+```
+
+We then calculate the correlation between the log2-ratios inferred from both platforms for the 133 overlapping samples. The agreement has improved compared to that of raw values. However, a simple visualisation reveals that, even though the correlations are high, we still have wide differences in scale. This is expected, as we didn't transform or scale the measurements in any way before the ratio calculation.
+```{r plot_correlation_of_ratios_raw, message=FALSE, warning=FALSE, echo=FALSE}
+for(i in colnames(SRS_gene_ratios_microarray)){
+  print(
+    plot(SRS_gene_ratios_microarray[shared_samples,i],
+         SRS_gene_ratios_RNAseq[shared_samples,i], 
+         xlim=c(-2.5,2.5),
+         ylim=c(-2.5,2.5),
+         xlab="log2-ratio in microarray",
+         ylab="log2-ratio in RNA-seq",
+         main=paste(i,"\n Cor=",
+                    round(cor(SRS_gene_ratios_microarray[shared_samples,i],
+                              SRS_gene_ratios_RNAseq[shared_samples,i],),2)))
+  )
+  print(abline(h=0, col="grey"))
+  print(abline(v=0, col="grey"))
+  print(abline(a=0,b=1, col="red"))
+}
+```
+
+### Log-ratios based on [0,1] scaled expression values
+In order to bring the predictor variables to the same scale for both technologies, we apply a scaling step before calcualting gene ratios. In brief, we scale the expression values of each gene to the [0,1] range by substracting the minimum value from each measurement and dividing by the range. Note that we then add 0.01 to the scaled values so as to avoid by-zero divisions down the line.
+```{r scale_SRS_genes, message=FALSE, warning=FALSE}
+# Microarray
+SRS_genes_scaled_microarray <- apply(SRS_genes_microarray, MARGIN=2, FUN=function(dat){
+  (dat-min(dat))/(max(dat)-min(dat))
+})
+SRS_genes_scaled_microarray <- SRS_genes_scaled_microarray + 0.01
+SRS_genes_scaled_microarray <- data.frame(SRS_genes_scaled_microarray)
+
+# RNA-seq
+SRS_genes_scaled_RNAseq <- apply(SRS_genes_RNAseq, MARGIN=2, FUN=function(dat){
+  (dat-min(dat))/(max(dat)-min(dat))
+})
+SRS_genes_scaled_RNAseq <- SRS_genes_scaled_RNAseq + 0.01
+SRS_genes_scaled_RNAseq <- data.frame(SRS_genes_scaled_RNAseq)
+```
+
+We then re-calculate log2-ratios based on these scaled values.
+```{r calculate_microarray_ratios, message=FALSE, warning=FALSE}
+# Microarray
+SRS_gene_ratios_scaled_microarray <- data.frame(log2(SRS_genes_scaled_microarray[,1:6]/SRS_genes_scaled_microarray$TDRD9 ))
+colnames(SRS_gene_ratios_scaled_microarray) <- paste(colnames(SRS_gene_ratios_scaled_microarray), ":TDRD9", sep="")
+
+# RNA-seq
+SRS_gene_ratios_scaled_RNAseq <- data.frame(log2(SRS_genes_scaled_RNAseq[,1:6]/SRS_genes_scaled_RNAseq$TDRD9))
+colnames(SRS_gene_ratios_scaled_RNAseq) <- paste(colnames(SRS_gene_ratios_scaled_RNAseq), ":TDRD9", sep="")
+```
+
+As shown by the plots below, predictor variables are now falling within the identity line, meaning they are in the same range regardless of the technology used to measure them.
+```{r correlation_of_ratios_scaled, message=FALSE, warning=FALSE, echo=FALSE}
+for(i in colnames(SRS_gene_ratios_scaled_microarray)){
+  print(
+    plot(SRS_gene_ratios_scaled_microarray[shared_samples,i],
+         SRS_gene_ratios_scaled_RNAseq[shared_samples,i], 
+         xlim=c(-2.5,2.5),
+         ylim=c(-2.5,2.5),
+         xlab="Scaled log2-ratio in microarray",
+         ylab="Scaled log2-ratio in RNA-seq",
+         main=paste(i,"\n Cor=",
+                    round(cor(SRS_gene_ratios_scaled_microarray[shared_samples,i],
+                              SRS_gene_ratios_scaled_RNAseq[shared_samples,i],),2)))
+  )
+  print(abline(h=0, col="grey"))
+  print(abline(v=0, col="grey"))
+  print(abline(a=0,b=1, col="red"))
+}
+```
+
+
+## Testing classifier performance in RNA-seq data
+To formally test if using scaled ratios results in a more transportable classifier, we apply classifiers built using microarray data to the RNA-seq dataset "off-the-shelf". We then compare if using scaled log-ratios performs better than using raw values when applying the model directly to RNA-seq without any modification.
+
+### SRS classifier based on raw expression values
+Importing classifier model
+```{r import_raw_classifier, message=FALSE, warning=FALSE}
+classifier_raw <- readRDS("/well/jknight/eddie/consensus_endotyping/results/SRS-classifier_7-genes_glm-of-raw-values.rds")
+```
+
+Predicting the SRS groups for all samples in the microarray and RNA-seq datasets.
+```{r predict_SRS_groups, message=FALSE, warning=FALSE}
+# Microarray
+## Renaming genes prior to prediction
+SRS_genes_microarray <- SRS_genes_microarray[,SRS_genes]
+colnames(SRS_genes_microarray)[1] <- "C11ORF46" 
+colnames(SRS_genes_microarray)[4] <- "EMR3" 
+
+## Predicting endotypes
+prediction_probabilities_microarray <- predict(classifier_raw, 
+        newdata = SRS_genes_microarray,
+        type="response")
+
+colData(gains_microarray)$Predicted_SRS_raw <- sapply(prediction_probabilities_microarray, FUN=function(p){
+  if(p > 0.5){
+    return(2)
+    } else{
+      return(1)
+      }
+  })
+
+
+# RNA-seq
+## Renaming genes prior to prediction
+SRS_genes_RNAseq <- SRS_genes_RNAseq[,SRS_genes]
+colnames(SRS_genes_RNAseq)[1] <- "C11ORF46" 
+colnames(SRS_genes_RNAseq)[4] <- "EMR3" 
+
+## Predicting endotypes
+prediction_probabilities_RNAseq <- predict(classifier_raw, 
+        newdata = SRS_genes_RNAseq,
+        type="response")
+
+colData(gains_RNAseq)$Predicted_SRS_raw <- sapply(prediction_probabilities_RNAseq, FUN=function(p){
+  if(p > 0.5){
+    return(2)
+    } else{
+      return(1)
+      }
+  })
+```
+
+The predicted p(SRS = 2) from this classifier look as expected for the microarray data
+```{r plot_prediction_probabilities_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+hist(prediction_probabilities_microarray, breaks=100, xlab="p(SRS = 2)", main="Predictions based on raw expression values (microarray)")
+```
+Which translates in overall a good classification
+```{r plot_pca_by_predicted_SRS_raw_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+pc_coords_microarray$Predicted_SRS_raw <- colData(gains_microarray)$Predicted_SRS_raw
+
+ggplot(pc_coords_microarray, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(Predicted_SRS_raw)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), name="Endotype", labels=c("SRS1","SRS2")) +
+  xlab(paste("PC1 (", round(pc_variance_microarray[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance_microarray[2]*100,2), "% variance explained)")) +
+  ggtitle("SRS assignments in the microarray data (based on raw values)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(size=12, hjust=0.5))
+```
+
+The predicted p(SRS = 2) from this classifier when applied to the RNA-seq data are all close to zero.
+```{r plot_prediction_probabilities_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+hist(prediction_probabilities_RNAseq, breaks=100, main="Predictions based on raw expression values (RNA-seq)", xlab="p(SRS = 2)")
+```
+
+Which results in the classifier failing and all samples being labeled as SRS1
+```{r plot_pca_by_predicted_SRS_raw_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+pc_coords$Predicted_SRS_raw <- colData(gains_RNAseq)$Predicted_SRS_raw
+
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(Predicted_SRS_raw)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), name="Endotype", labels=c("SRS1","SRS2")) +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  ggtitle("SRS assignments based on microarray-trained classifier (raw values)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(size=12, hjust=0.5))
+```
+
+### SRS classifier based on log-ratios
+We nwo import the classifier model built based on log2-ratios
+```{r import_ratios_classifier, message=FALSE, warning=FALSE}
+classifier_ratios <- readRDS("/well/jknight/eddie/consensus_endotyping/results/SRS-classifier_7-genes_glm-of-log2-gene-ratios.rds")
+```
+
+Predicting the SRS groups for all samples in the microarray and RNA-seq datasets.
+```{r predict_SRS_groups_from_ratios, message=FALSE, warning=FALSE}
+# Microarray
+## Renaming genes prior to prediction
+colnames(SRS_gene_ratios_scaled_microarray) <- gsub("ARL14EP","C11ORF46",colnames(SRS_gene_ratios_scaled_microarray))
+colnames(SRS_gene_ratios_scaled_microarray) <- gsub("ADGRE3","EMR3",colnames(SRS_gene_ratios_scaled_microarray))
+
+## Predicting endotypes
+prediction_probabilities_microarray <- predict(classifier_ratios, 
+        newdata = SRS_gene_ratios_scaled_microarray,
+        type="response")
+
+colData(gains_microarray)$Predicted_SRS_ratios <- sapply(prediction_probabilities_microarray, FUN=function(p){
+  if(p > 0.5){
+    return(2)
+    } else{
+      return(1)
+      }
+  })
+
+
+# RNA-seq
+## Renaming genes prior to prediction
+colnames(SRS_gene_ratios_scaled_RNAseq) <- gsub("ARL14EP","C11ORF46",colnames(SRS_gene_ratios_scaled_RNAseq))
+colnames(SRS_gene_ratios_scaled_RNAseq) <- gsub("ADGRE3","EMR3",colnames(SRS_gene_ratios_scaled_RNAseq))
+
+## Predicting endotypes
+prediction_probabilities_RNAseq <- predict(classifier_ratios, 
+        newdata = SRS_gene_ratios_scaled_RNAseq,
+        type="response")
+
+colData(gains_RNAseq)$Predicted_SRS_ratios <- sapply(prediction_probabilities_RNAseq, FUN=function(p){
+  if(p > 0.5){
+    return(2)
+    } else{
+      return(1)
+      }
+  })
+```
+
+The predicted p(SRS = 2) from this classifier look as expected for the microarray data
+```{r plot_prediction_probabilities_from_ratios_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+hist(prediction_probabilities_microarray, breaks=100, xlab="p(SRS = 2)", main="Predictions based on log gene ratios (microarray)")
+```
+Which translates in overall a good classification
+```{r plot_pca_by_predicted_SRS_ratios_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+pc_coords_microarray$Predicted_SRS_ratios <- colData(gains_microarray)$Predicted_SRS_ratios
+
+ggplot(pc_coords_microarray, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(Predicted_SRS_ratios)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), name="Endotype", labels=c("SRS1","SRS2")) +
+  xlab(paste("PC1 (", round(pc_variance_microarray[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance_microarray[2]*100,2), "% variance explained)")) +
+  ggtitle("SRS assignments in the microarray data (based on ratios values)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(size=12, hjust=0.5))
+```
+
+The predicted p(SRS = 2) from this classifier are now bimodally distributed.
+```{r plot_prediction_probabilities_from_ratios_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+hist(prediction_probabilities_RNAseq, breaks=100, main="Predictions based on log gene ratios (RNA-seq)", xlab="p(SRS = 2)")
+```
+
+Which results in a much better (though not perfect) classification
+```{r plot_pca_by_predicted_SRS_ratios_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+pc_coords$Predicted_SRS_ratios <- colData(gains_RNAseq)$Predicted_SRS_ratios
+
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(Predicted_SRS_ratios)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), name="Endotype", labels=c("SRS1","SRS2")) +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  ggtitle("SRS assignments based on microarray-trained classifier (gene ratios)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(size=12, hjust=0.5))
+```
+At this point, we can compare this classifier's predictions to the labels from unsupervised clustering across all those samplse which are shared between the RNA-seq and the micoarray data sets.
+
+They agree in:
+```{r compare_classifier_to_original_labels, message=FALSE, warning=FALSE}
+paste(round(mean(gains_RNAseq$SRSUnsup == gains_RNAseq$Predicted_SRS_ratios, na.rm=T)*100,2), "% of instances")
+```
+
+Furthermore, this model agrees with Katie's re-trained model in:
+```{r compare_ratios_model_to_retrained_model, message=FALSE, warning=FALSE}
+paste(round(mean(gains_RNAseq$SRSModel == gains_RNAseq$Predicted_SRS_ratios, na.rm=T)*100,2), "% of instances")
+```
+
+This is not a perfect agreement (and would probably be greatly improved by a selection of genes informed by cross-platform correlations), but it is a large improvement and does not need any adaptation to the model.
+
+# Session information
+```{r r_session, message=FALSE, warning=FALSE, echo=FALSE}
+sessionInfo()
+```
+

@@ -1,0 +1,587 @@
+---
+title: "Exploratory analysis and patient stratification of an Australian sepsis cohort"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading libraries
+```{r load_libraries, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(illuminaHumanv3.db)
+library(annotables)
+library(SummarizedExperiment)
+library(limma)
+library(SepstratifieR)
+library(XGR)
+library(cowplot)
+library(ggExtra)
+library(ggrepel)
+library(UpSetR)
+library(ggpubr)
+```
+
+## Loading data
+Loading expression matrix with raw counts measured using an Illumina HumanHT 12 v3 microarray.
+```{r load_data, message=FALSE, warning=FALSE}
+parnell_gex <- read.table("../data/Parnell-et-al_2013_Shock/GSE54514_non-normalized.txt.gz",
+                          sep="\t", header=T, row.names = 1)
+```
+
+Loading sample metadata.
+```{r load_metadata, message=FALSE, warning=FALSE}
+parnell_metadata <- read.table("../data/Parnell-et-al_2013_Shock/GSE54514_metadata.txt",
+                               sep="\t", header=T, row.names=1)
+```
+
+Loading microarray probe annotations
+```{r load_probe_annotations, message=FALSE, warning=FALSE}
+probe_annotations <- read_tsv("../data/Parnell-et-al_2013_Shock/HumanHT-12_V3_0_R1_11283641_A.txt")
+
+probe_annotations <- probe_annotations[,c("Transcript","ILMN_Gene","Symbol","Probe_Id","Chromosome")]
+```
+
+## Filtering probes by P value
+Keeping only probes with a detection P value < 0.01 in at least 10 samples.
+```{r filter_low_quality_probes, message=FALSE, warning=FALSE}
+detection_p_values <- parnell_gex[,grep(".Detection.Pval$",colnames(parnell_gex))]
+parnell_gex <- parnell_gex[rowSums(detection_p_values <= 0.01) > 10, grep(".Detection.Pval$",colnames(parnell_gex), invert = T)]
+```
+
+Matching column names between metadata and expression table
+```{r match_column_names, message=FALSE, warning=FALSE}
+colnames(parnell_gex) <- gsub("^X","P",colnames(parnell_gex))
+rownames(parnell_metadata) <- paste("P", rownames(parnell_metadata), sep="")
+
+parnell_metadata <- parnell_metadata[colnames(parnell_gex),]
+```
+
+## Variance-stabilising normalization
+Applying background correction and VSN normalization with limma.
+```{r normalize_data, message=FALSE, warning=FALSE}
+parnell_gex <- data.frame(normalizeVSN(parnell_gex))
+```
+
+## Collapsing probe measurements by gene
+We start by removing any probes not detected in the study from the annotation table
+```{r subset_probes, message=FALSE, warning=FALSE}
+probe_annotations <- probe_annotations[probe_annotations$Probe_Id %in% rownames(parnell_gex),]
+```
+
+We then identify all genes present in the study
+```{r list_genes_in_study, message=FALSE, warning=FALSE}
+genes_in_study <- unique(probe_annotations$ILMN_Gene)
+```
+
+We can now collapse probe measurements at the gene level (i.e. average the measurements from all probes mapping to a given gene)
+```{r collapse_probes_per_gene, message=FALSE, warning=FALSE}
+parnell_gex_per_gene <- sapply(genes_in_study, FUN = function(gene){
+  probe_ids <- as.character(probe_annotations$Probe_Id[probe_annotations$ILMN_Gene==gene])
+  mean_expression <- colMeans(parnell_gex[probe_ids,])
+  return(mean_expression)
+})
+parnell_gex_per_gene <- data.frame(t(parnell_gex_per_gene))
+```
+
+## Creating a gene annotation table
+Fetching the Ensembl ID for each probe which passed QC based on the gene it maps to.
+```{r map_probes_to_ensembl_ids, message=FALSE, warning=FALSE}
+probe2ensembl <- as.list(
+  illuminaHumanv3ENSEMBL[intersect(probe_annotations$Probe_Id, mappedkeys(illuminaHumanv3ENSEMBL))]
+)
+
+ensembl_ids <- c()
+for(i in probe_annotations$Probe_Id){
+  if(i %in% names(probe2ensembl)){
+    gene_id <- probe2ensembl[[i]][[1]]
+  } else{
+    gene_id <- NA
+  }
+  ensembl_ids <- c(ensembl_ids, gene_id)
+}
+probe_annotations$Ensembl_ID <- ensembl_ids
+```
+
+Fetching annotations for all genes in the study
+```{r fetch_gene_annotations, message=FALSE, warning=FALSE}
+gene_annotations <- data.frame(probe_annotations[!duplicated(probe_annotations$ILMN_Gene),
+                                                 c("ILMN_Gene","Ensembl_ID","Chromosome","Symbol")])
+rownames(gene_annotations) <- gene_annotations$ILMN_Gene
+```
+
+## Formatting metadata
+Adding a time point column to the metadata
+```{r add_day_to_metadata, message=FALSE, warning=FALSE}
+parnell_metadata$day <- as.numeric(gsub("^[A-Z]+_D","",parnell_metadata$group_day))
+```
+
+## Creating a Summarized Experiment objetct
+Creating a SummarizedExperiment containing expression values per gene and gene annotations.
+```{r create_summarized_experiment, message=FALSE, warning=FALSE}
+parnell <- SummarizedExperiment(assays = parnell_gex_per_gene,
+                               colData = parnell_metadata,
+                               rowData = gene_annotations)
+
+parnell
+```
+
+## Dimensionality reduction and visualisation
+We perform principal component analysis (PCA) based on all genes to enable data visualisation.
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca_res <- prcomp(t(assay(parnell)))   
+```
+
+Fetching PCA coordinates and the variance explained by each component.
+```{r fetch_pc_coords, message=FALSE, warning=FALSE}
+pc_coords <- data.frame(cbind(pca_res$x,colData(parnell)))
+pc_vars <- pca_res$sdev^2/sum(pca_res$sdev^2)
+```
+
+The scree plot below shows the amount of variance captured by each of the first 50 principal components.
+```{r plot_variance_explained_per_pc, message=FALSE, warning=FALSE, echo=FALSE}
+plot(pc_vars[1:50], 
+     type="b", cex=0.5, 
+     xlab="Principal Component", 
+     ylab="Proportion of variance explained")
+```
+
+As shown by the plot below, control samples separate from sepsis patients, and sepsis patients separate by severity.
+```{r plot_pca_by_group, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=disease_status), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance)")) +
+  scale_color_manual(values=c("#fdae61","#2c7bb6","#abd9e9"), 
+                     name="Group",
+                     labels=c("Healthy", "Sepsis (non-survivor)", "Sepsis (survivor)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "bottom", 
+        legend.justification = "centre",
+        legend.text = element_text(size=8),
+        legend.title = element_blank())
+ggMarginal(g1, type = "density", groupFill = T)
+```
+
+PC1 also correlates with severity, as measured by APACHE ii scores.
+```{r plot_pca_by_severity, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=apacheii), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+There is also a slight correlation with age, but no correlation with time point or any of the other covariates.
+```{r plot_pca_by_covariates, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=day, shape=disease_status), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=gender), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=site_of_infection), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Sample stratification into SRS groups
+We now assign each of these samples as SRS group and a quantitative SRSq score using the functions in the SepstratifieR package.
+
+Let's first define the set of 7 SRS-predictive genes
+```{r define_SRS_predictors, message=FALSE, warning=FALSE}
+predictor_genes <- read.table("../results/extended-predictor-gene-set.tsv", sep="\t", header=T)
+```
+
+We then extract these genes from the data set
+```{r extract_predictor_genes, message=FALSE, warning=FALSE}
+parnell_predictors <- data.frame(t(assay(parnell[predictor_genes$ILMN_gene,])))
+colnames(parnell_predictors) <- predictor_genes$gene_id
+
+head(parnell_predictors)
+```
+
+We can now apply the stratification algorithm to this data.
+```{r stratify_samples, message=FALSE, warning=FALSE}
+SRS_predictions <- stratifyPatients(parnell_predictors, gene_set = "extended", k=round(nrow(parnell_predictors)*0.3))
+```
+
+The frequency of SRS groups in this cohort is as follows:
+```{r tabulate_SRS_frequencies, message=FALSE, warning=FALSE}
+table(SRS_predictions@SRS)
+```
+
+Encouragingly, the samples in the MOSAIC cohort seem well aligned with the reference used by SepstratifieR.
+```{r plot_sample_alignment, message=FALSE, warning=FALSE}
+plotAlignedSamples(SRS_predictions)
+```
+
+Further, we see no outliers compared to the reference along any of the 7 principal components derived using the genes used for classification.
+```{r plot_sample_alignment_by_mNN_outlier, message=FALSE, warning=FALSE}
+outlier_plots <- list()
+for(i in 2:7){
+ outlier_plots[[i-1]] <- plotAlignedSamples(SRS_predictions, color_by = "mNN_outlier", pcs = c(1,i))
+}
+
+plot_grid(plotlist = outlier_plots, ncol=2, nrow=3)
+```
+
+The predicted sepsis scores (SRSq) are also relatively robust to the choice of 'k'.
+```{r run_sensititivy_analysis, message=FALSE, warning=FALSE}
+sensitivity_res <- runSensitivityAnalysis(parnell_predictors, gene_set = "extended", verbose = F)
+```
+
+We thus add the predictions from SepstratifieR as metadata to the Summarized Experiment object.
+```{r add_SRS_to_metadata, message=FALSE, warning=FALSE}
+parnell$SRS <- SRS_predictions@SRS
+parnell$SRSq <- SRS_predictions@SRSq
+
+pc_coords <- data.frame(cbind(pca_res$x,colData(parnell)))
+```
+
+
+## Correlation between SRS groups and disease severity
+Let's now assess whether the predicted SRS labels correlate with severity. 
+
+PCA reveals that the SRS signature correlates with severity, as captured by the first principal component.
+```{r plot_pca_by_SRS, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(data=pc_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  theme_classic() +
+  xlim(-50,100) +
+  theme(legend.position = "bottom")
+ggMarginal(g1, type = "density", groupFill = T)
+
+ggplot(data=pc_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=SRSq), size=3) +
+  xlim(-50,100) +
+  scale_color_gradient2(low = "lightgrey", mid = "steelblue", high = "darkblue", midpoint = 0.5) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+The number of patients by SRS groups is as follows for the different disease groups:
+```{r tabulate_srs_vs_severity, message=FALSE, warning=FALSE, echo=FALSE}
+pc_coords$disease_status <- factor(pc_coords$disease_status, levels=c("healthy","sepsis survivor","sepsis nonsurvivor"))
+
+table(pc_coords$disease_status, pc_coords$SRS)
+```
+
+
+There is a clear association between SRS and severity of illness
+```{r create_severity_vs_SRS_upset_plot, message=FALSE, warning=FALSE, echo=FALSE}
+upset(
+  fromList(
+    list(
+      "SRS1" = parnell$sample_id[parnell$SRS=="SRS1"],
+      "SRS2" = parnell$sample_id[parnell$SRS=="SRS2"],
+      "SRS3" = parnell$sample_id[parnell$SRS=="SRS3"],
+      "Healthy" = parnell$sample_id[parnell$disease_status=="healthy"],
+      "Sepsis (survivor)" = parnell$sample_id[parnell$disease_status=="sepsis survivor"],
+      "Sepsis (non-survivor)" = parnell$sample_id[parnell$disease_status=="sepsis nonsurvivor"]
+      )
+    ), 
+  order.by = "freq", 
+  sets = c("Sepsis (non-survivor)", "Sepsis (survivor)", "Healthy", "SRS1", "SRS2", "SRS3"), 
+  keep.order = T
+)
+```
+
+This can also be visualised in terms of Jaccard indexes.
+```{r define_getJaccardIndex, message=FALSE, warning=FALSE}
+getJaccardIndex <- function(a,b){
+  if( length(union(a,b)) == 0 ){
+    jaccard_index = 0
+  } else{
+   jaccard_index = length(intersect(a,b))/length(union(a,b)) 
+  }
+  
+  return(jaccard_index)
+}
+```
+
+```{r plot_jaccard_indexes_SRS_vs_severity, message=FALSE, warning=FALSE, echo=FALSE}
+jaccard_indexes <- data.frame(
+  sapply(unique(parnell$disease_status), FUN=function(i) {
+    sapply(unique(parnell$SRS), FUN=function(j){
+      getJaccardIndex(colnames(parnell)[parnell$disease_status == i], 
+                      colnames(parnell)[parnell$SRS==j])
+      })
+    })
+  )
+rownames(jaccard_indexes) <- unique(parnell$SRS)
+
+pheatmap::pheatmap(t(jaccard_indexes), cellheight=25, cellwidth=30, show_colnames = T)
+```
+
+To confirm this, we visualise the distribution of quantitative SRSq scores within each disease group. There is an association between these two variables.
+```{r plot_SRSq_vs_severity, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(data=pc_coords, aes(x=SRSq, y=disease_status)) +
+  geom_boxplot() +
+  geom_jitter(aes(color=SRS), height=0.1, size=2, alpha=0.8) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) + 
+  theme_bw() +
+  theme(axis.title.y = element_blank(), 
+        panel.grid = element_blank(), 
+        legend.position = "bottom")
+
+ggplot(data=pc_coords, aes(y=SRSq, x=day)) +
+  geom_boxplot(aes(x=as.factor(day),y=SRSq)) +
+  geom_jitter(aes(color=SRS), width=0.1, size=2) +
+  geom_smooth(method="lm") +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) + 
+  facet_grid(~disease_status) +
+  stat_cor() +
+  theme_bw() +
+  theme(axis.title.y = element_blank(), 
+        panel.grid = element_blank(), 
+        legend.position = "bottom")
+```
+
+We can also assess the temporal dynamics of SRSq in individuals with serial sampling available.
+```{r plot_SRSq_dynamics, message=FALSE, warning=FALSE, echo=FALSE}
+pc_coords$first_SRS <- sapply(pc_coords$group_id, FUN=function(n){
+  dat <- pc_coords[pc_coords$group_id == n,]
+  
+  dat <- dat[order(dat$day),]
+  first_SRS <- dat$SRS[1]
+  
+  return(first_SRS)
+})
+
+ggplot(data=pc_coords, aes(x=as.factor(day), y=SRSq)) +
+  geom_line(aes(group=group_id, color=first_SRS), alpha=0.8) +
+  geom_point(aes(color=SRS), size=2) +
+  facet_grid(~disease_status) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  theme_bw() +
+  theme(axis.title.y = element_blank(), 
+        panel.grid = element_blank(), 
+        legend.position = "bottom")
+```
+
+
+Finally, we assess for a correlation between SRSq and severity scores, as well as cell proportions.
+```{r plot_SRSq_vs_severity_and_cell_counts, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=SRSq, y=apacheii)) +
+  geom_smooth(method="lm") +
+  geom_point(aes(color=SRS),size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("APACHE II score") +
+  stat_cor() +
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5))
+
+ggplot(pc_coords, aes(x=SRSq, y=neutrophil_proportion)) +
+  geom_smooth(method="lm") +
+   geom_point(aes(color=SRS),size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  ylab("Neutrophil proportion") +
+  stat_cor() +
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5))
+```
+
+## Identifying SRS-associated gene expression programs
+Let's now use limma to identify genes whose expression levels are associated with SRSq.
+
+We start by defining a model matrix, with SRSq as the independent variable. 
+```{r define_design_matrix, message=FALSE, warning=FALSE}
+design_matrix <- model.matrix(~parnell$SRSq)
+```
+
+We then test for an association between gene expression level and SRSq using limma.
+```{r test_for_differential_expression, message=FALSE, warning=FALSE}
+fit <- lmFit(assay(parnell), design_matrix)
+fit2 <- contrasts.fit(fit, coef = 2)
+fit2 <- eBayes(fit2)
+```
+
+Finally, we retrieve the relevant statistics for any differentially expressed genes from limma's fit objects.We define differentially expressed genes as |fold change| >= 3.5 at an FDR <= 0.05. A fold-change of 3.5 is approximately equivalent to a 1-fold increase in gene expression for every 0.3-unit increase in SRSq. 
+```{r extract_DE_genes, message=FALSE, warning=FALSE}
+DEGs <- topTable(fit2, adjust="BH", number = nrow(parnell))
+DEGs$gene_name <- rownames(DEGs)
+DEGs$gene_id <- rowData(parnell)[DEGs$gene_name,]$Ensembl_ID
+DEGs$DE <- abs(DEGs$logFC) >= log2(3.5) & DEGs$adj.P.Val <= 0.05
+```
+
+A volcano plot representation of differentialy expressed genes looks as follows:
+```{r create_volcano_plot, message=FALSE, warning=FALSE, echo=FALSE}
+top_genes <- c(rownames(DEGs[DEGs$DE==T & DEGs$logFC > 0,])[1:15],
+               rownames(DEGs[DEGs$DE==T & DEGs$logFC < 0,])[1:10])
+
+ggplot(DEGs, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs, aes(color=DE)) +
+  geom_label_repel(data=DEGs[top_genes,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+```
+
+```{r plot_gex_vs_SRSq_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+gains_top_genes <- c("PGS1","GYG1","C19ORF59","WDR75","FAM38A","BMS1")
+cat(mean(DEGs[gains_top_genes,]$adj.P.Val < 0.05)*100,"% of top SRSq-associated genes in GAinS also pass FDR correction in this cohort.\n", sep="")
+
+DEGs[gains_top_genes,]
+
+par(mfrow=c(2,3))
+for(i in gains_top_genes){
+  print(
+    plot(parnell$SRSq,
+     assay(parnell[i,]),
+     col = parnell$SRS,
+     main=i,
+     xlab="SRSq",
+     ylab="Log-transformed expression",
+     pch=19)
+  )
+}
+```
+
+Below are some example genes known to be differentially expressed between SRS groups in GAinS.
+```{r create_volcano_plot_example_genes, message=FALSE, warning=FALSE, echo=FALSE}
+example_genes <- c("EMR3","GZMK","CD27","GZMH","CCR3","HLA-DMB","HLAC","CD6","CD177","MMP8","HPGD","TDRD9","GPR84","TNFAIP8L3")
+
+ggplot(DEGs, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs, aes(color=DE)) +
+  geom_label_repel(data=DEGs[example_genes,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRSq-associated genes\n", "(Microarray cohort)")) +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+```
+
+Let's compare these fold-change estimates with those calculated in the GAinS cohort.
+```{r load_gains_LFCs, message=FALSE, warning=FALSE}
+DEGs_gains <- read.table("../results/differential_gene_expression/GAinS/GAinS-microarray_DEGs_SRSq_limma_extended-signature.tsv", sep="\t", header=T)
+
+rownames(DEGs_gains) <- DEGs_gains$gene_name
+```
+
+```{r find_shared_genes, message=FALSE, warning=FALSE}
+shared_genes <- intersect(rownames(DEGs_gains), rownames(DEGs))
+```
+
+```{r compute_LFC_corelation, message=FALSE, warning=FALSE}
+cor_res <- cor.test(DEGs_gains[shared_genes,]$logFC, DEGs[shared_genes,]$logFC)
+cor_res
+```
+
+
+Approximately 14,000 genes are detected in both studies and there is a significant correlation between SRSq-associated log-fold changes in both studies. 
+
+This correlation looks as follows:
+```{r plot_LFC_correlation, message=FALSE, warning=FALSE, echo=FALSE}
+plot(DEGs_gains[shared_genes,]$logFC,
+     DEGs[shared_genes,]$logFC,
+     col="darkgrey",
+     pch=19,
+     xlab="LFC (GAinS)",
+     ylab="LFC (Parnell et al.)",
+     main=paste("Cor =", round(cor_res$estimate,2), "\np < 2.2e-16"))
+```
+
+Let's export these results as a text file for future reference.
+```{r export_DE_genes, eval=FALSE}
+write.table(DEGs[order(-DEGs$logFC),], 
+            file = "../results/differential_gene_expression/Parnell/Parnell_DEGs_SRSq_limma_extended-signature.tsv",
+            quote = F, row.names = F, sep="\t")
+```
+
+### Pathway enrichment analysis
+Next, let's assess whether genes positively or negatively associated with SRSq are enriched in any relevant biological pathways. We use the XGR method to test for enrichment in REACTOME pathways.
+```{r run_XGR, eval=FALSE}
+# Upregulated genes
+XGR_up <- xEnricherGenes(data=DEGs$gene_name[DEGs$DE & DEGs$logFC > 0],
+                         background = DEGs$gene_name,
+                         ontology="	MsigdbC2REACTOME")
+
+# Downregulated genes
+XGR_down <- xEnricherGenes(data=DEGs$gene_name[DEGs$DE & DEGs$logFC < 0], 
+                                       background = DEGs$gene_name,
+                                       ontology="MsigdbC2REACTOME")
+```
+
+```{r load_XGR_results, warning=FALSE, message=FALSE, echo=FALSE}
+load("../results/differential_gene_expression/Parnell/XGR-results-Parnell_extended-signature.rdata")
+```
+
+We then subset these results to include only significantly-enriched biological terms.
+```{r format_XGR_results, warning=FALSE, message=FALSE}
+## Reformatting results table
+XGR_up <- xEnrichViewer(XGR_up, top_num=length(XGR_up$adjp), sortBy="fc", details=TRUE)
+XGR_down <- xEnrichViewer(XGR_down, top_num=length(XGR_down$adjp), sortBy="fc", details=TRUE)
+
+## Keeping only significantly enriched pathways
+XGR_up <- XGR_up[XGR_up$adjp <= 0.05,]
+XGR_down <- XGR_down[XGR_down$adjp <= 0.05,]
+```
+
+In order to simplify the full output, we will focus exclusively on pathways matching at least one word in a bank of common immune terms.
+```{r define_immune_terms, message=FALSE, warning=FALSE}
+immune_terms <- c("NOTCH","TLR","Interleukin","NFk","MHC","(m|M)etabolism","Immun","ZAP-70","PD(-)?1","TCR","BCR","CD28","mTORC","SMAD","IFN","TGF","TRAF","Inflam","IRF","CTLA(-)?4","CD3","Interferon","Inflamm","(G|g)lyco")
+```
+
+When assessing pathway enrichment, the results look as follows:
+```{r plot_SRS_associated_pathways, message=FALSE, warning=FALSE, echo=FALSE}
+XGR_up$name <- factor(XGR_up$name, levels=rev(XGR_up$name[order(-XGR_up$or)]))
+ggplot(XGR_up[grepl(paste(immune_terms, collapse="|"), XGR_up$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkred") +
+  geom_hline(yintercept = log2(1), color="darkred", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("Positive enrichment along SRSq") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+
+XGR_down$name <- factor(XGR_down$name, levels=rev(XGR_down$name[order(-XGR_down$or)]))
+ggplot(XGR_down[grepl(paste(immune_terms, collapse="|"), XGR_down$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkblue") +
+  geom_hline(yintercept = log2(1), color="darkblue", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("Negative enrichment along SRSq") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+```
+
+
+## Exporting data set
+We can now export the SummarizedExperiment object as an RDS file for future reference.
+```{r export_as_rds, eval=FALSE}
+saveRDS(parnell, "../data/Parnell-et-al_2013_Shock/Parnell-et-al_gex_log2-transformed_VSN-normalized_collapsed-per-gene.rds")
+```
+
+## R session details
+```{r r_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```

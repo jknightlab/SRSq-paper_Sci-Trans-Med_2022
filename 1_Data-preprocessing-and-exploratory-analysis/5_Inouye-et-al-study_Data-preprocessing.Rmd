@@ -1,0 +1,157 @@
+---
+title: "Exploratory data analysis of a whole blood microarray data set of healthy individuals"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This markdown contains simple pre-processing and exploratory data analysis of a publicly available microarray data set of whole blood from unrelated individuals of Finnish ancestry. These individuals were part of the FINRISK study. Thus, they were relatively healthy, but with a slightly elevated risk for cardiovascular disease. 
+
+RNA was extracted from whole blood using the PAXgene Blood RNA System, and gene epxression measurement was performed with an Illumina HumanHT-12 microarray (i.e. polyA-based method). For more details on the generation and processing of this data set, refer to Inouye et al, 2010; PLOS Genetics:
+
+https://journals.plos.org/plosgenetics/article?id=10.1371/journal.pgen.1001113
+
+## Loading libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(SummarizedExperiment)
+library(annotables)
+library(illuminaHumanv4.db)
+```
+
+## Loading data
+Microarray data:
+```{r load_data, message=FALSE, warning=FALSE}
+inouye_gex <- read.table("../data/Inouye-et-al_2010_PLOS-genetics/E-TABM-1036.processed.txt",
+                         sep = "\t",
+                         header = T, 
+                         row.names = 1)
+```
+
+Illumina HumanHT probe mappings:
+```{r load_IlluminaHumanHT_probe_mappings, message=FALSE, warning=FALSE}
+probe_mappings <- read_tsv("/well/jknight/Sepsis/Gene_Expression/Microarray_combined_816/HumanHT-12_V4_0_R2_15002873_B.txt")
+```
+
+## Collapsing probe measurements by gene
+Keeping only information for probes present in the data set
+```{r find_probes_in_dataset, message=FALSE, warning=FALSE}
+probe_mappings <- filter(probe_mappings, Probe_Id %in% rownames(inouye_gex))
+probe_mappings <- data.frame(probe_mappings)
+```
+
+Adding Ensembl IDs to all probes based on the gene they map to
+```{r map_probes_to_ensembl_ids, message=FALSE, warning=FALSE}
+probe2ensembl <- as.list(
+  illuminaHumanv4ENSEMBL[intersect(probe_mappings$Probe_Id, mappedkeys(illuminaHumanv4ENSEMBL))]
+)
+
+ensembl_ids <- c()
+for(i in probe_mappings$Probe_Id){
+  if(i %in% names(probe2ensembl)){
+    gene_id <- probe2ensembl[[i]][[1]]
+  } else{
+    gene_id <- NA
+  }
+  ensembl_ids <- c(ensembl_ids, gene_id)
+}
+probe_mappings$Ensembl_ID <- ensembl_ids
+```
+
+Identifying all genes present in the study
+```{r list_genes_in_study, message=FALSE, warning=FALSE}
+genes_in_study <- unique(probe_mappings$ILMN_Gene)
+```
+
+Collapsing probe measurements at the gene level (i.e. averaging measurements from all probes mapping to a given gene)
+```{r collapse_probes_per_gene, message=FALSE, warning=FALSE}
+expression_per_gene <- sapply(genes_in_study, FUN = function(gene){
+  probe_ids <- as.character(probe_mappings$Probe_Id[probe_mappings$ILMN_Gene==gene])
+  mean_expression <- colMeans(inouye_gex[probe_ids,])
+  return(mean_expression)
+})
+expression_per_gene <- data.frame(t(expression_per_gene))
+```
+
+Fetching Ensembl annotations for all genes in the study
+```{r fetch_gene_annotations, message=FALSE, warning=FALSE}
+gene_annotations <- probe_mappings[!duplicated(probe_mappings$ILMN_Gene),
+                                c("ILMN_Gene","Ensembl_ID","Chromosome","Source","RefSeq_ID","Symbol","Protein_Product")]
+rownames(gene_annotations) <- gene_annotations$ILMN_Gene
+```
+
+## Creating a Summarized Experiment objetct
+Creating a SummarizedExperiment containing expression values per gene and gene annotations.
+```{r create_summarized_experiment, message=FALSE, warning=FALSE}
+inouye_microarray <- SummarizedExperiment(assays = expression_per_gene,
+                                          rowData = gene_annotations)
+```
+
+## Dimensionality reduction and visualisation
+Inspecting the relationship between expression variance and expression level.
+```{r estiamte_gene_variances, message=FALSE, warning=FALSE}
+gene_variances <- data.frame(mean_expression = rowMeans(assay(inouye_microarray)),
+                             variance = rowVars(as.matrix(assay(inouye_microarray))))
+```
+
+```{r find_top_variable_genes, message=FALSE, warning=FALSE}
+gene_variances <- gene_variances[order(-gene_variances$variance),]
+gene_variances$rank <- 1:nrow(gene_variances)
+gene_variances$top_variable <- FALSE
+gene_variances$top_variable[1:1000] <- TRUE
+gene_variances <- gene_variances[rownames(inouye_microarray),]
+```
+
+```{r plot_variance_vs_expression, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(gene_variances, aes(x=mean_expression, y=variance)) + 
+  geom_point(aes(color=top_variable), size=0.75) +
+  scale_color_manual(values=c("#8da0cb","#fc8d62")) +
+  xlab("Mean expression") +
+  ylab("Variance in expression") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Performing principal component analysis (PCA) based on all genes.
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca_inouye <- prcomp(t(assay(inouye_microarray)))   
+```
+
+Fetching PCA coordinates and the variance explained by each component.
+```{r fetch_pc_coords, message=FALSE, warning=FALSE}
+pc_coords_inouye <- data.frame(cbind(pca_inouye$x,colData(inouye_microarray)))
+pc_variance_inouye <- pca_inouye$sdev^2/sum(pca_inouye$sdev^2)
+```
+
+Most variance is explained by the first 5 PCs.
+```{r plot_variance_explained_per_pc, message=FALSE, warning=FALSE, echo=FALSE}
+plot(pc_variance_inouye[1:50], 
+     type="b", cex=0.5, 
+     xlab="Principal Component", 
+     ylab="Proportion of variance explained")
+```
+
+The samples in this study look as follows in PCA space. There seems to be some degree of heterogeneity, with potentially two groups of smaples.
+```{r plot_pca, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords_inouye, aes(x=PC1, y=PC2)) + 
+  geom_point(size=3) +
+  xlab(paste("PC1 (", round(pc_variance_inouye[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance_inouye[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Exporting data set
+Finally, the SummarizedExperiment object containing this data is exported as an RDS file.
+```{r export_as_rds, eval=FALSE}
+saveRDS(inouye_microarray, "../data/Inouye-et-al_2010_PLOS-genetics/Inouye-et-al_microarray_averaged-per-gene.rds")
+```
+
+## R session details
+```{r r_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```

@@ -1,0 +1,529 @@
+---
+title: "Stratification of individual samples into SRS groups using kNN-based classification"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(SummarizedExperiment)
+library(SepstratifieR)
+library(ggpubr)
+library(cowplot)
+```
+
+# Loading data
+Gene expression data sets:
+```{r load_gex_data, message=FALSE, warning=FALSE}
+gains_RNAseq <- readRDS("../data/gains_gex/gains_full_RNAseq_norm_log2-cpm.rds")
+gains_microarray <- readRDS("../data/gains_gex/gains_full_microarray_dedup_norm_combat_average-per-gene.rds")
+gains_qPCR <- readRDS("../data/gains_gex/gains_qpcr_deduped_log2-transformed_batch-corrected.rds")
+
+combat_RNAseq <- readRDS("../data/gains2_gex/COMBAT_total-RNAseq_log2-cpm.rds")
+```
+
+SRS predictions from random forest models:
+```{r load_SRS_preds, message=FALSE, warning=FALSE}
+# Results from the Davenport signature
+SRS_labels_davenport <- read.table("../results/classifier_predictions/full-gains-SRS-predictions_mNN-RF.tsv", sep="\t", header=T)
+
+# Results from the Extended signature
+SRS_labels_extended <- read.table("../results/classifier_predictions/gains-SRS-predictions_extended-gene-set_mNN-RF.tsv", sep="\t", header=T)
+```
+
+List of predictor genes:
+```{r load_predictor_genes, message=FALSE, warning=FALSE}
+predictors <- read.table("../results/extended-predictor-gene-set.tsv", sep="\t", header=T)
+```
+
+# Fetching predictor variables
+Fetching expression measurements for all predictor genes in GAinS and COMBAT
+```{r fetch_predictor_genes, message=FALSE, warning=FALSE}
+# GAinS
+gains_RNAseq_predictors <- data.frame(t(assay(gains_RNAseq[predictors$gene_id,])))
+
+gains_microarray_predictors <- data.frame(t(assay(gains_microarray[predictors$ILMN_gene,])))
+colnames(gains_microarray_predictors) <- predictors$gene_id
+
+gains_qpcr_predictors <- data.frame(t(assay(gains_qPCR[predictors$gene_name[13:19],])))
+colnames(gains_qpcr_predictors) <- predictors$gene_id[13:19]
+
+# COMBAT
+combat_predictors <- data.frame(t(assay(combat_RNAseq[predictors$gene_id,])))
+```
+
+Stratifying COMBAT patients using random forest models. 
+```{r stratify_COMBAT_by_rf, message=FALSE, warning=FALSE}
+SRS_labels_combat_davenport <- data.frame(
+  SRS = stratifyPatients(combat_predictors, gene_set = "davenport", k=50, verbose = F)@SRS,
+  SRSq = stratifyPatients(combat_predictors, gene_set = "davenport", k=50, verbose = F)@SRSq,
+  row.names=rownames(combat_predictors)
+  )
+
+SRS_labels_combat_extended <- data.frame(
+  SRS = stratifyPatients(combat_predictors, gene_set = "extended", k=50, verbose = F)@SRS,
+  SRSq = stratifyPatients(combat_predictors, gene_set = "extended", k=50, verbose = F)@SRSq,
+  row.names=rownames(combat_predictors)
+  )
+```
+
+
+# Comparing random forest and kNN classificaiton methods
+## Estimating the minimum sample size required for random forest based classification
+In order to assess the sample size requirements for SepstratifieR to perform accurately, we repeatedly stratify samples while randomly subseting the data set to increasingly lower sample sizes. We then compare the predictions obtained at low vs high sample size using Cohen's Kappa (for SRS groups) and RMSE (for SRSq).
+
+This analysis is based on RNA-seq samples from the COMBAT study, which are not included in the reference set and thus provide a more realistic assessment of the analyses of new data sets.
+```{r stratify_at_varying_sample_size_combat, message=FALSE, warning=FALSE}
+# Using the Davenport signature
+pred_errs_combat_davenport <- tibble()
+for(i in rev(seq(1,nrow(combat_predictors)))) {
+  s <- sample(rownames(combat_predictors), i)
+  dat <- combat_predictors[s,]
+  
+  p <- stratifyPatients(dat, gene_set = "davenport", k = 50, verbose = F)
+  
+  err <- RMSE(SRS_labels_combat_davenport[s,"SRSq"], p@SRSq)
+  kappa <- confusionMatrix(factor(SRS_labels_combat_davenport[s,"SRS"], levels=c("SRS1","SRS2","SRS3")), 
+                           factor(p@SRS,levels=c("SRS1","SRS2","SRS3")))$overall["Kappa"]
+  
+  pred_errs_combat_davenport <- rbind(pred_errs_combat_davenport, tibble(n=i,RMSE=err, Kappa=kappa))
+}
+
+# Using the Extended signature
+pred_errs_combat_extended <- tibble()
+for(i in rev(seq(1,nrow(combat_predictors)))) {
+  s <- sample(rownames(combat_predictors), i)
+  dat <- combat_predictors[s,]
+  
+  p <- stratifyPatients(dat, gene_set = "extended", k = 50, verbose = F)
+  
+  err <- RMSE(SRS_labels_combat_extended[s,"SRSq"], p@SRSq)
+  kappa <- confusionMatrix(factor(SRS_labels_combat_extended[s,"SRS"], levels=c("SRS1","SRS2","SRS3")), 
+                           factor(p@SRS,levels=c("SRS1","SRS2","SRS3")))$overall["Kappa"]
+  
+  pred_errs_combat_extended <- rbind(pred_errs_combat_extended, tibble(n=i,RMSE=err, Kappa=kappa))
+}
+```
+
+
+The relationship between prediction accuracy and sample size looks as follows. It seems that predictions with this function become unreliable at sample sizes smaller than 25 samples (grey line).
+```{r plot_preds_vs_sample_size_combat, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(pred_errs_combat_davenport, aes(x=n, y=RMSE)) +
+  geom_smooth() +
+  geom_point() +
+  ggtitle("Davenport signature") +
+  xlab("Sample size") +
+  ylab("RMSE (SRSq)") +
+  ylim(0,0.3) +
+  geom_hline(yintercept = 0.05, color="red") +
+  geom_vline(xintercept = 25, linetype="dashed", color="darkgrey") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(hjust = 0.5))
+
+g2 <- ggplot(pred_errs_combat_davenport, aes(x=n, y=Kappa)) +
+  geom_smooth() +
+  geom_point() +
+  xlab("Sample size") +
+  ylab("Cohen's Kappa (SRS)") +
+  ylim(0,1) +
+  geom_hline(yintercept = 0.8, color="red") +
+  geom_vline(xintercept = 25, linetype="dashed", color="darkgrey") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+g3 <- ggplot(pred_errs_combat_extended, aes(x=n, y=RMSE)) +
+  geom_smooth() +
+  geom_point() +
+  ggtitle("Extended signature") +
+  xlab("Sample size") +
+  ylab("RMSE (SRSq)") +
+  ylim(0,0.3) +
+  geom_hline(yintercept = 0.05, color="red") +
+  geom_vline(xintercept = 25, linetype="dashed", color="darkgrey") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(hjust = 0.5))
+
+g4 <- ggplot(pred_errs_combat_extended, aes(x=n, y=Kappa)) +
+  geom_smooth() +
+  geom_point() +
+  xlab("Sample size") +
+  ylab("Cohen's Kappa (SRS)") +
+  ylim(0,1) +
+  geom_hline(yintercept = 0.8, color="red") +
+   geom_vline(xintercept = 25, linetype="dashed", color="darkgrey") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+plot_grid(g1,g3,g2,g4, nrow=2, ncol=2)
+```
+
+This suggests that the main stratification approach of SepstratifieR (i.e. mNN alignment followed by random forest prediction) should not be used with sample sizes roughly below 25.
+
+## Comparing the performance of random forest and lazy learning stratification approaches
+For smaller sample sizes < 25, we can instead use a stratification method which relies on lazy learning (i.e. the projectPatient function within SepstratifieR).
+
+### GAinS samples
+Let's assess the performance of this approach by running it on all samples of the GAins study, one at a time, and then comparing their SRS/SRSq predictions to those obtained from random forest models.
+
+#### 1. Comparison in GAinS microarray samples
+```{r run_knn_stratifiation_gains_microarray, message=FALSE, warning=FALSE}
+projections_microarray_davenport <- data.frame(
+  t(
+    sapply(1:nrow(gains_microarray_predictors), FUN=function(i){
+      dat <- gains_microarray_predictors[i,]
+      p <- projectPatient(dat, gene_set = "davenport", k=20, verbose = F)
+      return(c(as.character(p@SRS),p@SRSq))
+      })
+    )
+  )
+colnames(projections_microarray_davenport) <- c("SRS","SRSq")
+projections_microarray_davenport$SRSq <- as.numeric(projections_microarray_davenport$SRSq)
+
+projections_microarray_davenport$True_SRS <- SRS_labels_davenport[SRS_labels_davenport$Assay=="Microarray",]$SRS
+projections_microarray_davenport$True_SRSq <- SRS_labels_davenport[SRS_labels_davenport$Assay=="Microarray",]$SRSq
+
+
+projections_microarray_extended <- data.frame(
+  t(
+    sapply(1:nrow(gains_microarray_predictors), FUN=function(i){
+      dat <- gains_microarray_predictors[i,]
+      p <- projectPatient(dat, gene_set = "extended", k=20, verbose = F)
+      return(c(as.character(p@SRS),p@SRSq))
+      })
+    )
+  )
+colnames(projections_microarray_extended) <- c("SRS","SRSq")
+projections_microarray_extended$SRSq <- as.numeric(projections_microarray_extended$SRSq)
+
+projections_microarray_extended$True_SRS <- SRS_labels_extended[SRS_labels_extended$Assay=="Microarray",]$SRS
+projections_microarray_extended$True_SRSq <- SRS_labels_extended[SRS_labels_extended$Assay=="Microarray",]$SRSq
+```
+
+The results from this comparison are as follows:
+```{r plot_knn_results_gains_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(projections_microarray_davenport, aes(x=True_SRSq, SRSq)) +
+  geom_abline(color="darkgrey") +
+  geom_point(aes(color=True_SRS)) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue"), name="SRS (random forest)") +
+  stat_cor() +
+  ggtitle("Davenport signature") +
+  xlab("SRSq (random forest)") +
+  ylab("SRSq (kNN projection)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(hjust=0.5), 
+        legend.position = "bottom")
+
+g2 <- ggplot(projections_microarray_extended, aes(x=True_SRSq, SRSq)) +
+  geom_abline(color="darkgrey") +
+  geom_point(aes(color=True_SRS)) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue"), name="SRS (random forest)") +
+  stat_cor() +
+  ggtitle("Extended signature") +
+  xlab("SRSq (random forest)") +
+  ylab("SRSq (kNN projection)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(hjust=0.5),
+        legend.position = "bottom")
+
+plot_grid(g1,g2)
+```
+
+
+In terms of SRSq prediction, this corresponds to an RMSE of:
+```{r print_RMSE_knn_gains_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+cat(
+  paste("Davenport signature (Microarray cohort): ",
+        round(RMSE(projections_microarray_davenport$True_SRSq, projections_microarray_davenport$SRSq),3),
+        "\nExtended signature (Microarray cohort): ",
+        round(RMSE(projections_microarray_extended$True_SRSq, projections_microarray_extended$SRSq),3),
+        sep="")
+)
+```
+
+In terms of SRS prediction, this corresponds to the following accuracy and Kappa:
+```{r print_confusion_matrix_knn_gains_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+cat("Davenport signature (Microarray cohort):\n\n")
+confusionMatrix(factor(projections_microarray_davenport$True_SRS, levels=c("SRS1","SRS2","SRS3")), 
+                factor(projections_microarray_davenport$SRS,levels=c("SRS1","SRS2","SRS3")))
+
+cat("\n\nExtended signature (Microarray cohort):\n\n")
+confusionMatrix(factor(projections_microarray_extended$True_SRS, levels=c("SRS1","SRS2","SRS3")), 
+                factor(projections_microarray_extended$SRS,levels=c("SRS1","SRS2","SRS3")))
+```
+
+#### 2. Comparison in GAinS RNA-seq samples
+```{r run_knn_stratifiation_gains_RNAseq, message=FALSE, warning=FALSE}
+projections_RNAseq_davenport <- data.frame(
+  t(
+    sapply(1:nrow(gains_RNAseq_predictors), FUN=function(i){
+      dat <- gains_RNAseq_predictors[i,]
+      p <- projectPatient(dat, gene_set = "davenport", k=20, verbose = F)
+      return(c(as.character(p@SRS),p@SRSq))
+      })
+    )
+  )
+colnames(projections_RNAseq_davenport) <- c("SRS","SRSq")
+projections_RNAseq_davenport$SRSq <- as.numeric(projections_RNAseq_davenport$SRSq)
+
+projections_RNAseq_davenport$True_SRS <- SRS_labels_davenport[SRS_labels_davenport$Assay=="RNA-seq",]$SRS
+projections_RNAseq_davenport$True_SRSq <- SRS_labels_davenport[SRS_labels_davenport$Assay=="RNA-seq",]$SRSq
+
+
+projections_RNAseq_extended <- data.frame(
+  t(
+    sapply(1:nrow(gains_RNAseq_predictors), FUN=function(i){
+      dat <- gains_RNAseq_predictors[i,]
+      p <- projectPatient(dat, gene_set = "extended", k=20, verbose = F)
+      return(c(as.character(p@SRS),p@SRSq))
+      })
+    )
+  )
+colnames(projections_RNAseq_extended) <- c("SRS","SRSq")
+projections_RNAseq_extended$SRSq <- as.numeric(projections_RNAseq_extended$SRSq)
+
+projections_RNAseq_extended$True_SRS <- SRS_labels_extended[SRS_labels_extended$Assay=="RNA-seq",]$SRS
+projections_RNAseq_extended$True_SRSq <- SRS_labels_extended[SRS_labels_extended$Assay=="RNA-seq",]$SRSq
+```
+
+The results from this comparison are as follows:
+```{r plot_knn_results_gains_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(projections_RNAseq_davenport, aes(x=True_SRSq, SRSq)) +
+  geom_abline(color="darkgrey") +
+  geom_point(aes(color=True_SRS)) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_cor() +
+  ggtitle("Davenport signature (RNAseq)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(hjust=0.5))
+
+g2 <- ggplot(projections_RNAseq_extended, aes(x=True_SRSq, SRSq)) +
+  geom_abline(color="darkgrey") +
+  geom_point(aes(color=True_SRS)) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_cor() +
+  ggtitle("Extended signature (RNAseq)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(hjust=0.5))
+
+plot_grid(g1,g2)
+```
+
+
+In terms of SRSq prediction, this corresponds to an RMSE of:
+```{r print_RMSE_knn_gains_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+cat(
+  paste("Davenport signature (RNAseq cohort): ",
+        round(RMSE(projections_RNAseq_davenport$True_SRSq, projections_RNAseq_davenport$SRSq),3),
+        "\nExtended signature (RNAseq cohort): ",
+        round(RMSE(projections_RNAseq_extended$True_SRSq, projections_RNAseq_extended$SRSq),3),
+        sep="")
+)
+```
+
+In terms of SRS prediction, this corresponds to the following accuracy and Kappa:
+```{r print_confusion_matrix_knn_gains_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+cat("Davenport signature (RNAseq cohort):\n\n")
+confusionMatrix(factor(projections_RNAseq_davenport$True_SRS, levels=c("SRS1","SRS2","SRS3")), 
+                factor(projections_RNAseq_davenport$SRS,levels=c("SRS1","SRS2","SRS3")))
+
+cat("\n\nExtended signature (RNAseq cohort):\n\n")
+confusionMatrix(factor(projections_RNAseq_extended$True_SRS, levels=c("SRS1","SRS2","SRS3")), 
+                factor(projections_RNAseq_extended$SRS,levels=c("SRS1","SRS2","SRS3")))
+```
+
+#### 3. Comparison in GAinS qRT-PCR samples
+```{r run_knn_stratifiation_gains_qpcr, message=FALSE, warning=FALSE}
+projections_qpcr <- data.frame(
+  t(
+    sapply(1:nrow(gains_qpcr_predictors), FUN=function(i){
+      dat <- 2^gains_qpcr_predictors[i,]
+      p <- projectPatient(dat, gene_set = "davenport", k=20, verbose = F)
+      return(c(as.character(p@SRS),p@SRSq))
+      })
+    )
+  )
+colnames(projections_qpcr) <- c("SRS","SRSq")
+projections_qpcr$SRSq <- as.numeric(projections_qpcr$SRSq)
+
+projections_qpcr$True_SRS <- SRS_labels_davenport[SRS_labels_davenport$Assay=="qPCR",]$SRS
+projections_qpcr$True_SRSq <- SRS_labels_davenport[SRS_labels_davenport$Assay=="qPCR",]$SRSq
+```
+
+The results from this comparison are as follows:
+```{r plot_knn_results_gains_qpcr, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(projections_qpcr, aes(x=True_SRSq, SRSq)) +
+  geom_abline(color="darkgrey") +
+  geom_point(aes(color=True_SRS)) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_cor() +
+  ggtitle("Davenport signature (qRT-PCR)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(hjust=0.5))
+```
+
+
+In terms of SRSq prediction, this corresponds to an RMSE of:
+```{r print_RMSE_knn_gains_qPCR, message=FALSE, warning=FALSE, echo=FALSE}
+cat(
+  paste("Davenport signature (qRT-PCR): ",
+        round(RMSE(projections_qpcr$True_SRSq, projections_qpcr$SRSq),3),
+        sep="")
+)
+```
+
+In terms of SRS prediction, this corresponds to the following accuracy and Kappa:
+```{r print_confusion_matrix_knn_gains_qPCR, message=FALSE, warning=FALSE, echo=FALSE}
+confusionMatrix(factor(projections_qpcr$True_SRS, levels=c("SRS1","SRS2","SRS3")), 
+                factor(projections_qpcr$SRS,levels=c("SRS1","SRS2","SRS3")))
+```
+
+### COMBAT samples
+Let's now assess the performance of this approach by running it on all samples of the COMBAT study, one at a time, and then comparing their SRS/SRSq predictions to those obtained from random forest models:
+```{r run_knn_stratifiation_on_combat, message=FALSE, warning=FALSE}
+# Based on the Davenport signature
+projections_combat_davenport <- data.frame(
+  t(
+    sapply(1:nrow(combat_predictors), FUN=function(i){
+      dat <- combat_predictors[i,]
+      p <- projectPatient(dat, gene_set = "davenport", k=20, verbose = F)
+      return(c(as.character(p@SRS),p@SRSq))
+      })
+    )
+  )
+colnames(projections_combat_davenport) <- c("SRS","SRSq")
+projections_combat_davenport$SRSq <- as.numeric(projections_combat_davenport$SRSq)
+
+projections_combat_davenport$True_SRS <- SRS_labels_combat_davenport$SRS
+projections_combat_davenport$True_SRSq <- SRS_labels_combat_davenport$SRSq
+
+# Based on the Extended signature
+projections_combat_extended <- data.frame(
+  t(
+    sapply(1:nrow(combat_predictors), FUN=function(i){
+      dat <- combat_predictors[i,]
+      p <- projectPatient(dat, gene_set = "extended", k=20, verbose = F)
+      return(c(as.character(p@SRS),p@SRSq))
+      })
+    )
+  )
+colnames(projections_combat_extended) <- c("SRS","SRSq")
+projections_combat_extended$SRSq <- as.numeric(projections_combat_davenport$SRSq)
+
+projections_combat_extended$True_SRS <- SRS_labels_combat_extended$SRS
+projections_combat_extended$True_SRSq <- SRS_labels_combat_extended$SRSq
+```
+
+The results from this comparison are as follows:
+```{r plot_knn_results_combat, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(projections_combat_davenport, aes(x=True_SRSq, SRSq)) +
+  geom_abline(color="darkgrey") +
+  geom_point(aes(color=True_SRS)) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue"), name="SRS (random forest)") +
+  stat_cor() +
+  ggtitle("Extended signature") +
+  xlab("SRSq (random forest)") +
+  ylab("SRSq (kNN projection)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(hjust=0.5),
+        legend.position = "bottom")
+
+g2 <- ggplot(projections_combat_extended, aes(x=True_SRSq, SRSq)) +
+  geom_abline(color="darkgrey") +
+  geom_point(aes(color=True_SRS)) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue"), name="SRS (random forest)") +
+  stat_cor() +
+  ggtitle("Extended signature") +
+  xlab("SRSq (random forest)") +
+  ylab("SRSq (kNN projection)") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(hjust=0.5),
+        legend.position = "bottom")
+
+plot_grid(g1,g2)
+```
+
+In terms of SRSq prediction, this corresponds to an RMSE of:
+```{r print_RMSE_knn_combat, message=FALSE, warning=FALSE, echo=FALSE}
+cat(
+  paste("Davenport signature: ",
+        RMSE(projections_combat_davenport$True_SRSq, projections_combat_davenport$SRSq),
+        "\nExtended signature: ",
+        RMSE(projections_combat_extended$True_SRSq, projections_combat_extended$SRSq),
+        sep="")
+)
+```
+
+In terms of SRS prediction, this corresponds to the following accuracy and Kappa
+
+1. Davenport signature:
+```{r print_confusion_matrix_knn_combat_davenport, message=FALSE, warning=FALSE, echo=FALSE}
+confusionMatrix(factor(projections_combat_davenport$True_SRS, levels=c("SRS1","SRS2","SRS3")), 
+                factor(projections_combat_davenport$SRS,levels=c("SRS1","SRS2","SRS3")))
+```
+
+```{r define_getJaccardIndex, message=FALSE, warning=FALSE}
+getJaccardIndex <- function(a,b){
+  if( length(union(a,b)) == 0 ){
+    jaccard_index = 0
+  } else{
+   jaccard_index = length(intersect(a,b))/length(union(a,b)) 
+  }
+  
+  return(jaccard_index)
+}
+```
+
+```{r plot_jaccard_indexes_davenport_signature, message=FALSE, warning=FALSE, echo=FALSE}
+jaccard_indexes <- data.frame(
+  sapply(unique(projections_combat_davenport$True_SRS), FUN=function(i) {
+    sapply(unique(projections_combat_davenport$SRS), FUN=function(j){
+      getJaccardIndex(rownames(combat_predictors)[projections_combat_davenport$True_SRS == i], 
+                      rownames(combat_predictors)[projections_combat_davenport$SRS==j])
+      })
+    })
+  )
+colnames(jaccard_indexes) <- unique(projections_combat_davenport$True_SRS)
+
+pheatmap::pheatmap(t(jaccard_indexes), cellheight=25, cellwidth=30, show_colnames = T)
+```
+
+2. Extended signature:
+```{r print_confusion_matrix_knn_combat_extended, message=FALSE, warning=FALSE, echo=FALSE}
+confusionMatrix(factor(projections_combat_extended$True_SRS, levels=c("SRS1","SRS2","SRS3")), 
+                factor(projections_combat_extended$SRS,levels=c("SRS1","SRS2","SRS3")))
+```
+
+```{r plot_jaccard_indexes_extended_signature, message=FALSE, warning=FALSE, echo=FALSE}
+jaccard_indexes <- data.frame(
+  sapply(unique(projections_combat_extended$True_SRS), FUN=function(i) {
+    sapply(unique(projections_combat_extended$SRS), FUN=function(j){
+      getJaccardIndex(rownames(combat_predictors)[projections_combat_extended$True_SRS == i], 
+                      rownames(combat_predictors)[projections_combat_extended$SRS==j])
+      })
+    })
+  )
+colnames(jaccard_indexes) <- unique(projections_combat_extended$True_SRS)
+
+pheatmap::pheatmap(t(jaccard_indexes), cellheight=25, cellwidth=30, show_colnames = T)
+```
+
+## R session
+```{r session_info, message=FALSE, warning=FALSE}
+sessionInfo()
+```

@@ -1,0 +1,204 @@
+---
+title: "Integration of GAinS microarray and RNA-seq data with CCA"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This markdown attempts to trial a method to identify a new set of predictor variables for SRS group. Though the 7 gene set used so far is performing quite well, these genes are not the most correlated bewtween different gene expression profiling technologies, and thus they don't tend to separate the groups as well in RNA-seq as they do in microarray data.
+
+Here, I use sparse canonical correlation analysis (sCCA) to identify a linear combination fo variables (i.e. a CC component) which is maximally correlated between microarray and RNA-seq and which separates SRS groups. The genes contributing the most to this component could be good candidates for a new classifier.
+
+# Loading R libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(SummarizedExperiment)
+library(PMA)
+library(ggrepel)
+library(ggpubr)
+library(ggExtra)
+```
+
+# Loading data
+Loading previously processed R data set objects contianing RNA-seq and microarray based measurements of gene expression patient samples in the GAinS study.
+```{r load_data, message=FALSE, warning=FALSE}
+gains_microarray <- readRDS("../data/gains_gex/gains_full_microarray_dedup_norm_combat_average-per-gene.rds")
+gains_RNAseq <- readRDS("../data/gains_gex/gains_full_RNAseq_norm_log2-cpm.rds")
+```
+
+# Performing sparse CCA
+We start by finding a shared set of samples between the microarray and the RNA-seq data.
+```{r list_shared_samples, message=FALSE, warning=FALSE}
+shared_samples <- intersect(colnames(gains_microarray),
+                            colnames(gains_RNAseq))
+```
+
+I then extract the expression measurements for these samples from each dataset and transpose the resulting matrix, so as to have samples as rows and genes (mesured variables) as columns.
+```{r extract_matrix_for_shared_samples, message=FALSE, warning=FALSE}
+RNAexp <- t(assay(gains_RNAseq[,shared_samples]))
+microarrayExp <- t(assay(gains_microarray[,shared_samples]))
+```
+
+We can now perform CCA for this set of samples. CCA is designed to find a linear combination of variables with maximal correlation between the two sets of measurements for the same samples (this is similar to PCA, only it maximizes correlation between the two sets rather than variance explained). Because the number of variables here (i.e. genes) greatly exceeds the number of samples (and thus variables cannot be linearly independent, which renders traditional CCA unusable), I use a "sparse" version of CCA implemented in the PMA package. This adaptation of CCA uses a lasso (L1) penalty to shrink the contribution of most variables to the CC components to zero. 
+
+I apply sparse CCA to these matrices (calculating a single CC component is enough for this analysis).
+```{r perform_cca, message=FALSE, warning=FALSE}
+cca_res <- CCA(RNAexp, microarrayExp, K=1)
+```
+
+We can now confirm that this new linear combination of variables truly correlates between technologies.
+```{r ger_cca_correlations, message=FALSE, warning=FALSE}
+cca_res$cors
+```
+
+# Analysing CCA results
+Let's now assess whether this new variable captures the separation by SRS endotype, as well as whether it is correlated with any other infromation about the samples.
+```{r extract_cc_coordinates, message=FALSE, warning=FALSE}
+cca_coords <- tibble(sample_id = shared_samples,
+                     CC1_X = RNAexp %*% cca_res$u,
+                     CC1_Y = microarrayExp %*% cca_res$v,
+                     SRS = gains_RNAseq[,shared_samples]$SRSUnsup,
+                     Diagnosis=gains_RNAseq[,shared_samples]$Diagnosis,
+                     Day=gains_RNAseq[,shared_samples]$Day,
+                     Age=gains_RNAseq[,shared_samples]$Age,
+                     Sex=gains_RNAseq[,shared_samples]$Sex,
+                     DaystoDeath=gains_RNAseq[,shared_samples]$DaystoDeath)
+```
+
+As can be seen in the following plots, CC1 very clearly separates SRS1 from SRS2 individuals. It is also correlated to a certain degree with Day of sampling (as would be expected given the experimental design and correlation between SRS and clinical output).
+```{r plot_cca_by_SRS, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(cca_coords[!is.na(cca_coords$SRS),], aes(x=CC1_X,y=CC1_Y)) +
+  geom_point(aes(color=as.factor(SRS))) +
+  scale_color_manual(values=c("darkred","steelblue"), na.value="grey", name="Endotype", labels=c("SRS1","SRS2")) +
+  xlab("CC1 (RNA-seq)") +
+  ylab("CC1 (Microarray)") +
+  stat_cor() +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "bottom")
+ggMarginal(g1, type = "density", groupFill = T)
+```
+
+```{r plot_cca_by_day, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(cca_coords[!is.na(cca_coords$SRS),], aes(x=CC1_X,y=CC1_Y)) +
+  geom_point(aes(color=as.factor(Day))) +
+  scale_color_manual(values = c("#a1dab4","#41b6c4","#225ea8"), name="Day") +
+  xlab("CC1 (RNA-seq)") +
+  ylab("CC1 (Microarray)") +
+  ggtitle("CC1 by Day") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "bottom")
+ggMarginal(g1, type = "density", groupFill = T)
+```
+
+```{r plot_cca_by_sex, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(cca_coords[!is.na(cca_coords$SRS),], aes(x=CC1_X,y=CC1_Y)) +
+  geom_point(aes(color=as.factor(Sex))) +
+  xlab("CC1 (RNA-seq)") +
+  ylab("CC1 (Microarray)") +
+  ggtitle("CC1 by Sex") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "bottom")
+ggMarginal(g1, type = "density", groupFill = T)
+```
+
+```{r plot_cca_by_age, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(cca_coords[!is.na(cca_coords$SRS),], aes(x=CC1_X,y=CC1_Y)) +
+  geom_point(aes(color=Age)) +
+  xlab("CC1 (RNA-seq)") +
+  ylab("CC1 (Microarray)") +
+  ggtitle("CC1 by Age") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "bottom")
+```
+
+Having confirmed that CC1 is very highly correlated between microarray and RNA-seq, and that it separates patients by SRS group, let's now find out which genes contribute the most to this variable.
+
+Let's first label the weights of CC1 by the gene they involve.
+```{r add_cca_rownames, message=FALSE, warning=FALSE}
+rownames(cca_res$u) <- rowData(gains_RNAseq)$gene_name
+rownames(cca_res$v) <- colnames(microarrayExp)
+
+rownames(cca_res$v)[rownames(cca_res$v) == "C11ORF46"] <- "ARL14EP"
+rownames(cca_res$v)[rownames(cca_res$v) == "EMR3"] <- "ADGRE3"
+```
+
+We then retrieve the CC1 loadings for genes present in both data sets
+```{r retrieve_loadings_for_shared_genes, message=FALSE, warning=FALSE}
+shared_genes <- intersect(rownames(cca_res$u), rownames(cca_res$v))
+
+CC1_loadings <- data.frame(
+  gene_name = shared_genes,
+  gene_id = rowData(gains_microarray)[shared_genes,]$Ensembl_ID,
+  RNAseq_loading = cca_res$u[shared_genes,],
+  Microarray_loading = cca_res$v[shared_genes,],
+  row.names = shared_genes)
+```
+
+Now let's identify the genes with highest loadings in both the RNA-seq and microarray data set. To do so, we rank genes by the magnitude of their contribution to CC1, and retrieve as candidate predictors any genes amongst the top 1% rank in both the RNA-seq and the Microarray data sets.
+```{r find_top_contributing_genes, message=FALSE, warning=FALSE}
+n_genes <- round(nrow(CC1_loadings)*0.01)
+top_CC1_genes <- intersect(CC1_loadings$gene_name[order(-abs(CC1_loadings$RNAseq_loading))][1:n_genes],
+                           CC1_loadings$gene_name[order(-abs(CC1_loadings$Microarray_loading))][1:n_genes])
+```
+
+```{r plot_cca_loadings, message=FALSE, warning=FALSE}
+plot(CC1_loadings$Microarray_loading[order(CC1_loadings$Microarray_loading)], 
+     main="Microarray", 
+     ylab="CC1 loading",
+     col="darkgrey",
+     pch=19)
+plot(CC1_loadings$RNAseq_loading[order(CC1_loadings$RNAseq_loading)], 
+     main="RNA-seq", 
+     ylab="CC1 loading",
+     col="darkgrey",
+     pc=19)
+
+ggplot(CC1_loadings, aes(x=Microarray_loading, y=RNAseq_loading)) +
+  geom_point(color="grey") +
+  geom_point(data=CC1_loadings[top_CC1_genes,], aes(x=Microarray_loading, y=RNAseq_loading), color="darkred") +
+  geom_label_repel(data=CC1_loadings[top_CC1_genes,], aes(x=Microarray_loading, y=RNAseq_loading, label=gene_name), color="darkred") +
+  xlab("CC1 loadings (Microarray data)") +
+  ylab("CC1 loadings (RNA-seq data)") +
+  theme_classic()
+```
+
+Let's compare this with the weight CCA assigned to the 7 genes in Emma's SRS classifier
+```{r list_SRS_genes, message=FALSE, warning=FALSE}
+SRS_genes <- data.frame(
+  gene_name = c("ARL14EP","CCNB1IP1","DYRK2","ADGRE3","MDC1","TDRD9","ZAP70"),
+  gene_id = c("ENSG00000152219","ENSG00000100814","ENSG00000127334","ENSG00000131355","ENSG00000137337","ENSG00000156414","ENSG00000115085"),
+  ILMN_gene = c("C11ORF46","CCNB1IP1","DYRK2","EMR3","MDC1","TDRD9","ZAP70")
+)
+
+ggplot(CC1_loadings, aes(x=Microarray_loading, y=RNAseq_loading)) +
+  geom_point(color="grey") +
+  geom_point(data=CC1_loadings[SRS_genes$gene_name,], aes(x=RNAseq_loading, y=Microarray_loading), color="darkred") +
+  geom_label_repel(data=CC1_loadings[SRS_genes$gene_name,], aes(x=RNAseq_loading, y=Microarray_loading, label=gene_name), color="darkred") +
+  xlab("CC1 loadings (Microarray data)") +
+  ylab("CC1 loadings (RNA-seq data)") +
+  theme_classic()
+```
+
+Encouragingly, the weight assigned to these genes goes in the expected direction (possitive for TDRD9, negative for the rest). However, two genes were completely discarded by the lasso penalty of the model in either of the data sets. This suggests there might be better predictor variables out there which maximally correlate between both sets.
+
+# Exporting top CC1 genes
+Finally, we export the new candidate predictor genes identified from CCA.
+```{r export_new_candidate_predictors, eval=FALSE}
+top_CC1_genes <- data.frame(gene_name = top_CC1_genes,
+                            gene_id = rowData(gains_microarray)[top_CC1_genes,]$Ensembl_ID)
+write.table(top_CC1_genes, "../results/candidate-predictors-from-CCA.tsv", sep="\t", quote = F, row.names = F)
+```
+
+# R session information
+```{r r_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```
+

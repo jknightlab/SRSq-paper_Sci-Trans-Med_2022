@@ -1,0 +1,575 @@
+---
+title: "Association between SRSq changes and clinical outcomes"
+author: "Eddie Cano-Gamez"
+date: "16/05/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggpubr)
+library(survival)
+library(survminer)
+```
+
+# Loading data
+```{r load_data, message=FALSE, warning=FALSE}
+gains_srs <- read.table("../results/classifier_predictions/gains-SRS-predictions_extended-gene-set_mNN-RF.tsv", header = T, sep = "\t")
+gains_outdat <- read.table("../data/gains_clinical_data/gains_clinical_and_outcome_data.tsv", header=T, sep="\t")
+```
+
+
+# Formatting data
+```{r reformat_data, message=FALSE, warning=FALSE}
+gains_srs$Patient_id <- gsub("_[0-9]$","",gains_srs$Sample_id)
+gains_srs$Time_point <- as.numeric(gsub("^.*_","",gains_srs$Sample_id))
+gains_srs <- gains_srs[!is.na(gains_srs$Time_point),]
+```
+
+
+# Analysing the correlation between SRSq changes and outcomes
+Identifying serial samples
+```{r filter_serial_samples, message=FALSE, warning=FALSE}
+# Full data set (i.e. combining RNA-seq and Microarray)
+serial_samples <- names(table(gains_srs$Patient_id))[table(gains_srs$Patient_id) > 1]
+gains_srs <- gains_srs[gains_srs$Patient_id %in% serial_samples,]
+
+# Microarray samples only
+gains_srs_microarray <- gains_srs[gains_srs$Assay == "Microarray",] 
+serial_samples_microarray <- names(table(gains_srs_microarray$Patient_id))[table(gains_srs_microarray$Patient_id) > 1]
+gains_srs_microarray <- gains_srs_microarray[gains_srs_microarray$Patient_id %in% serial_samples_microarray,]
+
+# RNA-seq samples only
+gains_srs_RNAseq <- gains_srs[gains_srs$Assay == "RNA-seq",]
+serial_samples_RNAseq <- names(table(gains_srs_RNAseq$Patient_id))[table(gains_srs_RNAseq$Patient_id) > 1]
+gains_srs_RNAseq <- gains_srs_RNAseq[gains_srs_RNAseq$Patient_id %in% serial_samples_RNAseq,]
+```
+
+
+Calculating delta SRSq
+```{r estiamte_SRSq_changes, message=FALSE, warning=FALSE}
+# Full data set
+SRSq_diff <- tibble()
+for(i in unique(gains_srs$Patient_id)) {
+  dat <- gains_srs[gains_srs$Patient_id == i, ]
+  
+  dat <- dat[!duplicated(dat$Time_point),]
+  if(nrow(dat) <= 1) {
+    # Removing instances where the same time point was profiled more than once with two different technologies
+    SRSq_diff <- rbind(
+    SRSq_diff, 
+    tibble("Patient_id"=i,
+           "Time_diff"=NA,
+           "SRSq_diff"=NA, 
+           "SRSq_LFC"= NA,
+           "SOFA_diff"=NA, 
+           "SOFA_LFC"=NA,
+           "Censored_mortality"=NA,
+           "Time_to_event"=NA,
+           "Age_bin"=NA,
+           "Diagnosis"=NA)
+    )
+    next
+  }
+  
+  dat <- dat[order(dat$Time_point, decreasing = T),]
+  
+  delta_time <- dat$Time_point[1] - dat$Time_point[nrow(dat)]
+    
+  delta_SRSq <- dat$SRSq[1] - dat$SRSq[nrow(dat)]
+  SRSq_log_fold_change <- log2(dat$SRSq[1]/dat$SRSq[nrow(dat)])
+  
+  clindat <- gains_outdat[gains_outdat$SubjectBarCode == i, ]
+  delta_SOFA <- clindat$SOFA_last - clindat$SOFA_first
+  SOFA_log_fold_change <- clindat$SOFA_last/clindat$SOFA_first
+  
+  age_bin <- clindat$age_bin[1]
+  diagnosis <- clindat$diagnosis[1]
+  
+  mortality <- clindat$mortality_event_28d_censored
+  time_to_death <- clindat$time_to_event_28d_censored
+  
+  SRSq_diff <- rbind(
+    SRSq_diff, 
+    tibble("Patient_id"=i,
+           "Time_diff"=delta_time,
+           "SRSq_diff"=delta_SRSq, 
+           "SRSq_LFC"= SRSq_log_fold_change,
+           "SOFA_diff"=delta_SOFA,
+           "SOFA_LFC"=SOFA_log_fold_change,
+           "Censored_mortality"=mortality, 
+           "Time_to_event"=time_to_death,
+           "Age_bin"=age_bin,
+           "Diagnosis"=diagnosis)
+    )
+}
+SRSq_diff <- na.omit(SRSq_diff)
+SRSq_diff$SRSq_change_rate <- SRSq_diff$SRSq_diff/SRSq_diff$Time_diff
+SRSq_diff$SRSq_LFC_rate <- SRSq_diff$SRSq_LFC/SRSq_diff$Time_diff
+
+# Microarray cohort
+SRSq_diff_microarray <- tibble()
+for(i in unique(gains_srs_microarray$Patient_id)) {
+  dat <- gains_srs_microarray[gains_srs_microarray$Patient_id == i, ]
+  dat <- dat[order(dat$Time_point, decreasing = T),]
+  
+  delta_time <- dat$Time_point[1] - dat$Time_point[nrow(dat)]
+  
+  delta_SRSq <- dat$SRSq[1] - dat$SRSq[nrow(dat)]
+  SRSq_log_fold_change <- log2(dat$SRSq[1]/dat$SRSq[nrow(dat)])
+ 
+  clindat <- gains_outdat[gains_outdat$SubjectBarCode == i, ]
+  delta_SOFA <- clindat$SOFA_last - clindat$SOFA_first
+  SOFA_log_fold_change <- clindat$SOFA_last/clindat$SOFA_first
+ 
+  age_bin <- clindat$age_bin[1]
+  diagnosis <- clindat$diagnosis[1]
+  
+  mortality <- clindat$mortality_event_28d_censored
+  time_to_death <- clindat$time_to_event_28d_censored
+  
+  SRSq_diff_microarray <- rbind(
+    SRSq_diff_microarray, 
+    tibble("Patient_id"=i,
+           "Time_diff"=delta_time,
+           "SRSq_diff"=delta_SRSq, 
+           "SRSq_LFC"= SRSq_log_fold_change,
+           "SOFA_diff"=delta_SOFA, 
+           "SOFA_LFC"=SOFA_log_fold_change,
+           "Censored_mortality"=mortality, 
+           "Time_to_event"=time_to_death,
+           "Age_bin"=age_bin,
+           "Diagnosis"=diagnosis)
+    )
+}
+SRSq_diff_microarray$SRSq_change_rate <- SRSq_diff_microarray$SRSq_diff/SRSq_diff_microarray$Time_diff
+SRSq_diff_microarray$SRSq_LFC_rate <- SRSq_diff_microarray$SRSq_LFC/SRSq_diff_microarray$Time_diff
+
+# RNA-seq cohort
+SRSq_diff_RNAseq <- tibble()
+for(i in unique(gains_srs_RNAseq$Patient_id)) {
+  dat <- gains_srs_RNAseq[gains_srs_RNAseq$Patient_id == i, ]
+  dat <- dat[order(dat$Time_point, decreasing = T),]
+  
+  delta_time <- dat$Time_point[1] - dat$Time_point[nrow(dat)]
+  
+  delta_SRSq <- dat$SRSq[1] - dat$SRSq[nrow(dat)]
+  SRSq_log_fold_change <- log2(dat$SRSq[1]/dat$SRSq[nrow(dat)])
+  
+  clindat <- gains_outdat[gains_outdat$SubjectBarCode == i, ]
+  
+  delta_SOFA <- clindat$SOFA_last - clindat$SOFA_first
+  SOFA_log_fold_change <- clindat$SOFA_last/clindat$SOFA_first
+  
+  age_bin <- clindat$age_bin[1]
+  diagnosis <- clindat$diagnosis[1]
+  
+  mortality <- clindat$mortality_event_28d_censored
+  time_to_death <- clindat$time_to_event_28d_censored
+  
+  SRSq_diff_RNAseq <- rbind(
+    SRSq_diff_RNAseq, 
+    tibble("Patient_id"=i,
+           "Time_diff"=delta_time,
+           "SRSq_diff"=delta_SRSq, 
+           "SRSq_LFC"= SRSq_log_fold_change,
+           "SOFA_diff"=delta_SOFA, 
+           "SOFA_LFC"=SOFA_log_fold_change,
+           "Censored_mortality"=mortality,
+           "Time_to_event"=time_to_death,
+           "Age_bin"=age_bin,
+           "Diagnosis"=diagnosis)
+    )
+}
+SRSq_diff_RNAseq$SRSq_change_rate <- SRSq_diff_RNAseq$SRSq_diff/SRSq_diff_RNAseq$Time_diff
+SRSq_diff_RNAseq$SRSq_LFC_rate <- SRSq_diff_RNAseq$SRSq_LFC/SRSq_diff_RNAseq$Time_diff
+```
+
+
+Assessing correlation with clinical outcomes
+
+1) SOFA:
+```{r plot_SRSq_diff_vs_SOFA, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(SRSq_diff, aes(x=SRSq_diff, y=SOFA_diff)) +
+  geom_point() +
+  geom_vline(xintercept = 0, color="darkgrey", linetype="dashed") +
+  geom_hline(yintercept = 0, color="darkgrey", linetype="dashed") +
+  stat_cor() +
+  ggtitle("Full GAinS cohort") +
+  theme_classic()
+
+ggplot(SRSq_diff_microarray, aes(x=SRSq_diff, y=SOFA_diff)) +
+  geom_point() +
+  geom_vline(xintercept = 0, color="darkgrey", linetype="dashed") +
+  geom_hline(yintercept = 0, color="darkgrey", linetype="dashed") +
+  stat_cor() +
+  ggtitle("GAinS microarray cohort") +
+  theme_classic()
+
+ggplot(SRSq_diff_RNAseq, aes(x=SRSq_diff, y=SOFA_diff)) +
+  geom_point() +
+  geom_vline(xintercept = 0, color="darkgrey", linetype="dashed") +
+  geom_hline(yintercept = 0, color="darkgrey", linetype="dashed") +
+  stat_cor() +
+  ggtitle("GAinS RNA-seq cohort") +
+  theme_classic()
+```
+
+2) 28-day mortality
+```{r fit_Cox_model, message=FALSE, warning=FALSE}
+# Full GAinS Cohort
+cat("\nFull GAinS Cohort results:\n")
+cat("Log-fold change in SRSq:\n")
+summary(
+  coxph(
+    Surv(Time_to_event, Censored_mortality) ~ SRSq_LFC, 
+    data = SRSq_diff
+  )
+)
+
+
+cat("Rate of SRSq LFC:\n")
+summary(
+  coxph(
+    Surv(Time_to_event, Censored_mortality) ~ SRSq_LFC_rate, 
+    data = SRSq_diff
+  )
+)
+
+
+SRSq_diff$Diagnosis <- factor(SRSq_diff$Diagnosis, levels=c("FP","CAP"))
+Cox_multivariate <- coxph(
+  Surv(Time_to_event, Censored_mortality) ~ SRSq_LFC + Age_bin + Diagnosis, 
+  data = SRSq_diff
+  )
+ggforest(Cox_multivariate)
+
+Cox_multivariate <- coxph(
+  Surv(Time_to_event, Censored_mortality) ~ SRSq_LFC_rate + Age_bin + Diagnosis, 
+  data = SRSq_diff
+  )
+ggforest(Cox_multivariate)
+
+# Microarray samples
+cat("\nGAinS microarray cohort results:\n")
+cat("Log-fold change in SRSq:\n")
+summary(
+  coxph(
+    Surv(Time_to_event, Censored_mortality) ~ SRSq_LFC, 
+    data = SRSq_diff_microarray
+  )
+)
+
+cat("Rate of SRSq LFC:\n")
+summary(
+  coxph(
+    Surv(Time_to_event, Censored_mortality) ~ SRSq_LFC_rate, 
+    data = SRSq_diff_microarray
+  )
+)
+
+# RNA-seq samples
+cat("\nGAinS RNA-seq cohort results:\n")
+cat("Log-fold change in SRSq:\n")
+summary(
+  coxph(
+    Surv(Time_to_event, Censored_mortality) ~ SRSq_LFC, 
+    data = SRSq_diff_RNAseq
+  )
+)
+
+cat("Rate of SRSq LFC:\n")
+summary(
+  coxph(
+    Surv(Time_to_event, Censored_mortality) ~ SRSq_LFC_rate, 
+    data = SRSq_diff_RNAseq
+  )
+)
+```
+
+A brief visual inspection reveals that, while in the RNA-seq cohort we observe large decreases of SRSq over time, these are much more reduced in the microarray cohort. 
+```{r plot_SRSq_diff, message=FALSE, warning=FALSE, echo=FALSE}
+hist(SRSq_diff$SRSq_LFC, breaks=50, main="Full Microarray cohort", xlab = "SRSq LFC")
+abline(v = -0.2, col="darkred")
+
+hist(SRSq_diff_microarray$SRSq_LFC, breaks=20, main="GAinS Microarray cohort", xlab = "SRSq LFC")
+abline(v = -0.2, col="darkred")
+
+hist(SRSq_diff_RNAseq$SRSq_LFC, breaks=50, main="GAinS RNA-seq cohort", xlab = "SRSq LFC")
+abline(v = -0.2, col="darkred")
+```
+
+Thus, to avoid noise from samples with no real SRSq change (i.e. with delta SRSqs clustered around zero), we consider that a patient exhibits SRSq decrease if their SRSq dropped by at leasat 0.1 units between the first and last time point.
+
+Under these considerations, Kaplan-Meier curves for patients startified by SRSq decrease look as follows:
+```{r plot_Kaplan_Meier_curves, message=FALSE, warning=FALSE, echo=FALSE}
+# Full cohort
+SRSq_diff$SRSq_decrease <- 1*(SRSq_diff$SRSq_LFC < -0.1)
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event, Censored_mortality) ~ SRSq_decrease,
+                data=SRSq_diff), 
+  xlab = "Days since ICU admission", 
+  ylab = "28-day survival probability",
+  title = "Full GAinS cohort",
+  conf.int = T,
+  pval = T,
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+SRSq_diff_microarray$SRSq_decrease <- 1*(SRSq_diff_microarray$SRSq_LFC < -0.1)
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event, Censored_mortality) ~ SRSq_decrease,
+                data=SRSq_diff_microarray), 
+  xlab = "Days since ICU admission", 
+  ylab = "28-day survival probability",
+  title = "GAinS microarray cohort",
+  conf.int = T,
+  pval = T,
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+SRSq_diff_RNAseq$SRSq_decrease <- 1*(SRSq_diff_RNAseq$SRSq_LFC < -0.1)
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event, Censored_mortality) ~ SRSq_decrease,
+                data=SRSq_diff_RNAseq), 
+  xlab = "Days since ICU admission", 
+  ylab = "28-day survival probability",
+  title = "GAinS RNA-seq cohort",
+  conf.int = T,
+  pval = T,
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+SRSq_LFC_quartiles <- summary(SRSq_diff$SRSq_LFC)
+SRSq_diff$SRSq_quartile <- NA
+SRSq_diff$SRSq_quartile[SRSq_diff$SRSq_LFC < SRSq_LFC_quartiles[2]] <- "Bottom 25%"
+SRSq_diff$SRSq_quartile[SRSq_diff$SRSq_LFC > SRSq_LFC_quartiles[2] & SRSq_diff$SRSq_LFC < SRSq_LFC_quartiles[5]] <- "Central 50%"
+SRSq_diff$SRSq_quartile[SRSq_diff$SRSq_LFC > SRSq_LFC_quartiles[5]] <- "Top 25%"
+SRSq_diff$SRSq_quartile <- factor(SRSq_diff$SRSq_quartile,
+                                         levels=c("Bottom 25%",
+                                                  "Central 50%",
+                                                  "Top 25%"))
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event, Censored_mortality) ~ SRSq_quartile,
+                data=SRSq_diff), 
+  xlab = "Days since ICU admission", 
+  ylab = "28-day survival probability",
+  title = "Full GAinS cohort", 
+  pval = T,
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+
+SRSq_LFC_quartiles <- summary(SRSq_diff_RNAseq$SRSq_LFC)
+SRSq_diff_RNAseq$SRSq_quartile <- NA
+SRSq_diff_RNAseq$SRSq_quartile[SRSq_diff_RNAseq$SRSq_LFC < SRSq_LFC_quartiles[2]] <- "Bottom 25%"
+SRSq_diff_RNAseq$SRSq_quartile[SRSq_diff_RNAseq$SRSq_LFC > SRSq_LFC_quartiles[2] & SRSq_diff_RNAseq$SRSq_LFC < SRSq_LFC_quartiles[5]] <- "Central 50%"
+SRSq_diff_RNAseq$SRSq_quartile[SRSq_diff_RNAseq$SRSq_LFC > SRSq_LFC_quartiles[5]] <- "Top 25%"
+SRSq_diff_RNAseq$SRSq_quartile <- factor(SRSq_diff_RNAseq$SRSq_quartile,
+                                         levels=c("Bottom 25%",
+                                                  "Central 50%",
+                                                  "Top 25%"))
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event, Censored_mortality) ~ SRSq_quartile,
+                data=SRSq_diff_RNAseq), 
+  xlab = "Days since ICU admission", 
+  ylab = "28-day survival probability",
+  title = "GAinS RNA-seq cohort",
+  conf.int = T,
+  pval = T,
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+```
+It is worth noting here the reduced power of the microarray cohort. This is because:
+
+a) There are half as many serial samples here as in the RNA-seq cohort (101 vs 177)
+b) The inclusion criteria enriched for patients with higher mortality (the microarray validation cohort was designed to include a 50:50 mixed of survivors and non-survivors), who will thus be less likely to show an SRSq decrease over time. Indeed, the proportion of patients showing SRSq decrease over time is only 19% in the microarray cohort, compared to 34% in the RNA-seq cohort.
+
+Below is a similar analysis, but thresholding patients based on rate rather than magnitude of SRSq change (i.e. average SRSq decrease per day).
+```{r plot_SRSq_change_rates, message=FALSE, warning=FALSE, echo=FALSE}
+hist(SRSq_diff$SRSq_LFC_rate, breaks = 50, main="Full GAinS cohort", xlab="Rate of SRSq change (Daily log-fold change)")
+abline(v = -0.025)
+
+hist(SRSq_diff_microarray$SRSq_LFC_rate, breaks = 30, main="GAinS microarray cohort", xlab="Rate of SRSq change (Daily log-fold change)")
+abline(v = -0.025)
+
+hist(SRSq_diff_RNAseq$SRSq_LFC_rate, breaks = 50, main="GAinS RNA-seq cohort", xlab="Rate of SRSq change (average log-fold change per day)")
+abline(v = -0.025)
+```
+
+```{r plot_Kaplan_Meier_curves_SRSq_change_rate, message=FALSE, warning=FALSE, echo=FALSE}
+# Full cohort
+SRSq_diff$SRSq_decrease <- 1*(SRSq_diff$SRSq_LFC_rate < -0.025)
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event, Censored_mortality) ~ SRSq_decrease,
+                data=SRSq_diff), 
+  xlab = "Days since ICU admission", 
+  ylab = "28-day survival probability",
+  title = "Full GAinS cohort",
+  conf.int = T,
+  pval = T,
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+SRSq_diff_microarray$SRSq_decrease <- 1*(SRSq_diff_microarray$SRSq_LFC_rate < -0.025)
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event, Censored_mortality) ~ SRSq_decrease,
+                data=SRSq_diff_microarray), 
+  xlab = "Days since ICU admission", 
+  ylab = "28-day survival probability",
+  title = "GAinS microarray cohort",
+  conf.int = T,
+  pval = T,
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+SRSq_diff_RNAseq$SRSq_decrease <- 1*(SRSq_diff_RNAseq$SRSq_LFC_rate < 0)
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event, Censored_mortality) ~ SRSq_decrease,
+                data=SRSq_diff_RNAseq), 
+  xlab = "Days since ICU admission", 
+  ylab = "28-day survival probability",
+  title = "GAinS RNA-seq cohort",
+  conf.int = T,
+  pval = T,
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+SRSq_LFC_quartiles <- summary(SRSq_diff_RNAseq$SRSq_LFC_rate)
+SRSq_diff_RNAseq$SRSq_quartile <- NA
+SRSq_diff_RNAseq$SRSq_quartile[SRSq_diff_RNAseq$SRSq_LFC_rate < SRSq_LFC_quartiles[2]] <- "Bottom 25%"
+SRSq_diff_RNAseq$SRSq_quartile[SRSq_diff_RNAseq$SRSq_LFC_rate > SRSq_LFC_quartiles[2] & SRSq_diff_RNAseq$SRSq_LFC_rate < SRSq_LFC_quartiles[5]] <- "Central 50%"
+SRSq_diff_RNAseq$SRSq_quartile[SRSq_diff_RNAseq$SRSq_LFC_rate > SRSq_LFC_quartiles[5]] <- "Top 25%"
+SRSq_diff_RNAseq$SRSq_quartile <- factor(SRSq_diff_RNAseq$SRSq_quartile,
+                                         levels=c("Bottom 25%",
+                                                  "Central 50%",
+                                                  "Top 25%"))
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event, Censored_mortality) ~ SRSq_quartile,
+                data=SRSq_diff_RNAseq), 
+  xlab = "Days since ICU admission", 
+  ylab = "28-day survival probability",
+  title = "GAinS RNA-seq cohort",
+  conf.int = T,
+  pval = T,
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+```
+
+Sliding window analysis:
+```{r run_sliding_window_survival_analysis_RNAseq, message=FALSE, warning=FALSE}
+vars_of_interest <- c("Time_to_event", "Censored_mortality" ,"SRSq_LFC_rate")
+gains_roll_RNAseq <- SRSq_diff_RNAseq[,vars_of_interest]
+gains_roll_RNAseq <- gains_roll_RNAseq[order(gains_roll_RNAseq$SRSq_LFC_rate, decreasing = T),]
+
+window_width <- round(nrow(gains_roll_RNAseq)*0.35)
+
+rolling_survival_RNAseq <- zoo::rollapply(gains_roll_RNAseq, width=window_width, FUN = function(dat){
+  
+  dat <- data.frame(dat)
+  dat <- dat[!is.na(dat$SRSq_LFC_rate),]
+  
+  median_SRSq_LFC_rate <- median(dat[,"SRSq_LFC_rate"])
+  
+  surv_res <- summary(survfit(Surv(Time_to_event, Censored_mortality) ~ 1,
+                             data=dat), times=28)
+  mean_surv <- surv_res$surv
+  surv_upper <- surv_res$upper
+  surv_lower <- surv_res$lower
+  
+  res <- cbind(median_SRSq_LFC_rate, surv_lower, mean_surv, surv_upper)
+  return(res)
+  
+  },
+  
+  by.column = F)
+
+rolling_survival_RNAseq <- data.frame(rolling_survival_RNAseq)
+```
+
+As hypothesized, an increase in SRSq is accompanied by a proportional increase in mortality.
+```{r plot_sliding_window_survival_curves, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(rolling_survival_RNAseq, aes(x=median_SRSq_LFC_rate, y=1-mean_surv)) +
+  geom_errorbar(aes(ymin=1-surv_lower, ymax=1-surv_upper), colour="lightgrey") +
+  geom_point(size=0.5) +
+  ylim(0,0.4) +
+  ggtitle("RNA-seq cohort") +
+  ylab("Mortality") +
+  xlab("Time-normalised SRSq LFC (median of window)") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5))
+```
+
+# R session
+```{r session_info, message=FALSE, warning=FALSE}
+sessionInfo()
+```
+

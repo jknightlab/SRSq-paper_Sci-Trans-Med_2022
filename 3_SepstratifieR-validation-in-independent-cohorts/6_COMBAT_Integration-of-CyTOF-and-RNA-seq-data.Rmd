@@ -1,0 +1,394 @@
+---
+title: "Integration of CyTOF and RNA-seq expression measurements in whole blood leukocytes from COVID-19 patients"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Here, we compare gene expression measurements as measured at the RNA (obtained from RNA-sequencing) and protein (mass cytometry) level in whole blood leukocytes from COVID-19 patients.
+
+These data were generated within the COMBAT consortium. For more information, refer to the corresponding publication:
+
+https://doi.org/10.1016/j.cell.2022.01.012
+
+## Loading libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(SummarizedExperiment)
+library(limma)
+library(gap)
+library(ggExtra)
+library(ggpubr)
+library(ggrepel)
+library(cowplot)
+```
+
+## Loading data
+We load a data set containing log-CPM measurements from RNA-seq
+```{r load_RNAseq_data, message=FALSE, warning=FALSE}
+COMBAT_RNAseq <- readRDS("../data/gains2_gex/COMBAT_total-RNAseq_log2-cpm.rds")
+
+# Subsetting to COVID patients and controls only
+COMBAT_RNAseq <- COMBAT_RNAseq[,COMBAT_RNAseq$Source != "Sepsis"]
+```
+
+We next load a second data set containing protein expression measurements for a subset of these same patients. This data set was derived by using mass cytometry (CyTOF) to measure the expression of 45 proteins in whole blood leukocytes. CyTOF measurements were then averaged across all cells of each individual to create a pseduobulk proteomic profile of their whole blood. 
+```{r load_CyTOF_data, message=FALSE, warning=FALSE}
+COMBAT_CyTOF_pseudobulk <- read.table("../data/COMBAT/COMBAT_CyTOF-non-depleted_pseudobulk-per-sample.tsv", sep="\t", header = T)
+colnames(COMBAT_CyTOF_pseudobulk) <- gsub("\\.","-",colnames(COMBAT_CyTOF_pseudobulk))
+
+# Removing unnecessary columns (e.g. mass cytometer parameters and variables for singlet identification)
+COMBAT_CyTOF_pseudobulk <- COMBAT_CyTOF_pseudobulk[!rownames(COMBAT_CyTOF_pseudobulk) %in% c("Event_length","Ir191Di", "Ir193Di"),]
+```
+
+## Formatting data
+We begin by finding which patient samples are present in both the RNA-seq and the CyTOF data set. Only these samples are kept.
+```{r subset_CyTOF_samples, message=FALSE, warning=FALSE}
+COMBAT_CyTOF_pseudobulk <- COMBAT_CyTOF_pseudobulk[,colnames(COMBAT_CyTOF_pseudobulk) %in% COMBAT_RNAseq$CyTOF_sample_ID]
+COMBAT_CyTOF_pseudobulk[1:5,1:5]
+```
+
+We next create a summarized experiment object containing both CyTOF measurements and sample metadata for these patients.
+```{r create_summarized_experiment, message=FALSE, warning=FALSE}
+metadat <- data.frame(colData(COMBAT_RNAseq)[COMBAT_RNAseq$CyTOF_sample_ID %in% colnames(COMBAT_CyTOF_pseudobulk), ])
+rownames(metadat) <- metadat$CyTOF_sample_ID
+metadat <- metadat[colnames(COMBAT_CyTOF_pseudobulk),]
+
+COMBAT_CyTOF <- SummarizedExperiment(COMBAT_CyTOF_pseudobulk,
+                                     colData = metadat)
+COMBAT_CyTOF
+```
+SRS and SRSq predictions have been previously derived for these patients based on RNA-seq profiles using SepstratifieR. Thus, we read in a file containing this information.
+```{r load_SRS_preds, message=FALSE, warning=FALSE}
+SRS_combat <- read.table("../results/classifier_predictions/COMBAT-SRS-predictions_COVID-only_extended-gene-set_mNN-RF.tsv", 
+                         sep="\t", header = T, row.names = 1)
+```
+
+SRS and SRSq predictions are then added as metadata to the summarized experiment objects.
+```{r add_SRS_preds_as_metadata, message=FALSE, warning=FALSE}
+# RNA-seq
+COMBAT_RNAseq$SRS <- SRS_combat[colnames(COMBAT_RNAseq),]$SRS
+COMBAT_RNAseq$SRSq <- SRS_combat[colnames(COMBAT_RNAseq),]$SRSq
+
+# CyTOF
+COMBAT_CyTOF$SRS <- SRS_combat[COMBAT_CyTOF$RNASeq_sample_ID,]$SRS
+COMBAT_CyTOF$SRSq <- SRS_combat[COMBAT_CyTOF$RNASeq_sample_ID,]$SRSq
+```
+
+
+## Exploratory analysis
+We can now begin exploring the pseudobulk mass cytometry data. We begin by performnig principal component analysis on all 45 proteins.
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca_res <- prcomp(t(assay(COMBAT_CyTOF)))
+pca_var <- pca_res$sdev^2/sum(pca_res$sdev^2)*100
+```
+
+The first component alone explains the vast majortiy of the variance.
+```{r plot_variance_explained, message=FALSE, warning=FALSE, echo=FALSE}
+plot(pca_var, type="b", xlab="Principal component", ylab="Variance explained (%)")
+```
+
+A visual inspection reveals that this component correlates with disease severity and with SRS endotypes.
+```{r plot_CyTOF_PCA, message=FALSE, warning=FALSE, echo=FALSE}
+pca_coords <- data.frame(cbind(pca_res$x, colData(COMBAT_CyTOF)))
+pca_coords$Source <- factor(pca_coords$Source, levels=c("HV","COVID_HCW_MILD","COVID_MILD","COVID_SEV","COVID_CRIT"))
+
+g1 <- ggplot(pca_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=Source),size=3) +
+  theme_classic() +
+  scale_color_manual(values=rev(c("#fc8d59","#fee090","#e0f3f8","#91bfdb","#4575b4"))) +
+  xlab(paste("PC1 (",round(pca_var[1],2),"% variance)", sep = "")) +
+  ylab(paste("PC2 (",round(pca_var[2],2),"% variance)", sep = "")) +
+  theme(legend.position = "bottom")
+ggMarginal(g1, groupFill = T)
+
+g2 <- ggplot(pca_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=SRS),size=3) +
+  scale_color_manual(values = c("darkred","steelblue","darkblue")) +
+  xlab(paste("PC1 (",round(pca_var[1],2),"% variance)", sep = "")) +
+  ylab(paste("PC2 (",round(pca_var[2],2),"% variance)", sep = "")) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+ggMarginal(g2, groupFill = T)
+
+ggplot(pca_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=SRSq),size=3) +
+  xlab(paste("PC1 (",round(pca_var[1],2),"% variance)", sep = "")) +
+  ylab(paste("PC2 (",round(pca_var[2],2),"% variance)", sep = "")) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+## Integration of protein and RNA measurements
+We now integrate both datasets to assess the extent to which RNA and protein levels of each gene correlate with one another. 
+We first load a data frame containing information to map the name of CyTOF antibody targets to their corresponding genes.
+```{r load_antibody_to_gene_mapping_table, message=FALSE, warning=FALSE}
+cytof_gene_mappings <- read.csv("../data/COMBAT/CyTOF-to-RNAseq-gene-mapping.csv", header=T)
+rownames(cytof_gene_mappings) <- cytof_gene_mappings$cytof_name
+```
+
+We then use this information to match RNA and protein measurements which tag the same gene. Note that some genes cannot be mapped (e.g. CD45RA and CD45RO, which represent splicing variants not available from the current gene-level information in the RNA-seq data set). This results in 41 genes sucessfully matched between modalities.
+```{r match_cytof_to_rnaseq, message=FALSE, warning=FALSE}
+shared_genes <- cytof_gene_mappings[cytof_gene_mappings$gene_name %in% rowData(COMBAT_RNAseq)$gene_name,]
+
+# CyTOF
+cytof <- data.frame(assay(COMBAT_CyTOF[shared_genes$cytof_name,]))
+colnames(cytof) <- gsub("\\.","-",colnames(cytof))
+rownames(cytof) <- shared_genes$gene_name
+
+# RNA-seq
+rnaseq <- COMBAT_RNAseq[rowData(COMBAT_RNAseq)$gene_name %in% shared_genes$gene_name, 
+                        COMBAT_RNAseq$CyTOF_sample_ID %in% colnames(cytof)]
+rownames(rnaseq) <- rowData(rnaseq)$gene_name
+colnames(rnaseq) <- rnaseq$CyTOF_sample_ID
+rnaseq <- data.frame(assay(rnaseq))
+rnaseq <- rnaseq[shared_genes$gene_name,]
+colnames(rnaseq) <- gsub("\\.","-",colnames(rnaseq))
+rnaseq <- rnaseq[,colnames(cytof)]
+```
+
+Having mapped genes to proteins, we can compute their Pearson correlation across samples and test whether it is significantly different from zero.
+```{r compute_RNA_protein_correlations, message=FALSE, warning=FALSE}
+RNA_protein_cors <- tibble()
+for(i in 1:nrow(cytof)) {
+  cors <- cor.test(
+    as.numeric(cytof[i,]),
+    as.numeric(rnaseq[i,])
+    )
+ RNA_protein_cors <- rbind(
+   RNA_protein_cors,
+   tibble(
+     "gene"=shared_genes$gene_name[i],
+     "protein"=shared_genes$cytof_name[i],
+     "cor"=cors$estimate,
+     "pval"=cors$p.value
+     )
+   )
+}
+
+head(RNA_protein_cors)
+```
+
+```{r plot_correlation_coefs, message=FALSE, warning=FALSE, echo=FALSE}
+hist(RNA_protein_cors$cor, breaks=15, main="RNA-protein correlations", xlab="Pearson correlation", ylab="Number of genes", xlim=c(-1,1))
+abline(v = 0, col="darkred")
+```
+
+A visual inspection of the correlation p values for these 41 genes reveals reveals substantial p-value inflation. This is corroborated by comparing the p value distribution to a uniform distribution using a Kolmogorov-Smirnov test. This inflation confirms that protein-RNA pairs indeed tend to be more correlated than would be expected by chance. 
+```{r plot_correlation_p_values, message=FALSE, warning=FALSE, echo=FALSE}
+qqunif(RNA_protein_cors$pval)
+ks.test(RNA_protein_cors$pval, "punif", 0, 1)
+```
+
+Visualisation of correlation coefficients in the style of a volcano plot confirms that the vast majority of genes show a significant and positive correlation between RNA and protein levels. A notable exception is CD45 (PTPRC), which shows anticorrelation between both layers of information. This could be due to splicing variants being differentially captured by the CyTOF antibody or other technical biases.
+```{r plot_correlation_estimates, message=FALSE, warning=FALSE, echo=FALSE}
+bonferroni_corr <- 0.05/nrow(RNA_protein_cors)
+RNA_protein_cors$significant <- as.factor(1*(RNA_protein_cors$pval < bonferroni_corr))
+ggplot(RNA_protein_cors, aes(x=cor, y=-log10(pval))) +
+  geom_point(aes(color=significant), size=3) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  geom_label_repel(data=RNA_protein_cors[RNA_protein_cors$significant==1,], aes(label=protein), color="darkred") +
+  geom_hline(yintercept = -log10(bonferroni_corr), linetype="dashed") +
+  theme_classic()
+```
+
+As an example, the plots below show the correlation between RNA-seq and CyTOF measurements for the top 5 most correlated genes, as well as for the anti-correlated gene PTPRC.
+```{r plot_gene_protein_correlations, message=FALSE, warning=FALSE, echo=FALSE}
+joint_dataset <- data.frame(cbind(t(cytof), t(rnaseq)))
+colnames(joint_dataset) <- c(paste(rownames(cytof),"protein", sep="_"), paste(rownames(rnaseq),"RNA", sep="_"))
+
+g1 <- ggplot(joint_dataset, aes(x=KLRB1_RNA, y=KLRB1_protein)) +
+  geom_smooth(method="lm") +
+  geom_point(color="darkgrey", size=3) +
+  xlab("KLRB1 (RNA-seq)") +
+  ylab("KLRB1 (CyTOF average)") +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+g2 <- ggplot(joint_dataset, aes(x=CD4_RNA, y=CD4_protein)) +
+  geom_smooth(method="lm") +
+  geom_point(color="darkgrey", size=3) +
+  xlab("CD4 (RNA-seq)") +
+  ylab("CD4 (CyTOF average)") +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+g3 <- ggplot(joint_dataset, aes(x=CD28_RNA, y=CD28_protein)) +
+  geom_smooth(method="lm") +
+  geom_point(color="darkgrey", size=3) +
+  xlab("CD28 (RNA-seq)") +
+  ylab("CD28 (CyTOF average)") +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+g4 <- ggplot(joint_dataset, aes(x=CCR7_RNA, y=CCR7_protein)) +
+  geom_smooth(method="lm") +
+  geom_point(color="darkgrey", size=3) +
+  xlab("CCR7 (RNA-seq)") +
+  ylab("CCR7 (CyTOF average)") +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+g5 <- ggplot(joint_dataset, aes(x=CD3G_RNA, y=IL7R_protein)) +
+  geom_smooth(method="lm") +
+  geom_point(color="darkgrey", size=3) +
+  xlab("IL7R (RNA-seq)") +
+  ylab("CD127 (CyTOF average)") +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+g6 <- ggplot(joint_dataset, aes(x=PTPRC_RNA, y=PTPRC_protein)) +
+  geom_smooth(method="lm") +
+  geom_point(color="darkgrey", size=3) +
+  xlab("PTPRC (RNA-seq)") +
+  ylab("CD45 (CyTOF average)") +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+plot_grid(g1,g2,g3,g4,g5,g6,ncol=3,nrow=2)
+```
+
+## Association of protein levels with SRSq
+We can now assess whether genes associated with SRSq at the RNA level also tend to show the same effect at the protein level.
+
+We first load a list of genes deemed to be SRSq-associated based on their RNA-seq expression patterns in the GAinS study.
+```{r load_SRSq_associated_genes, message=FALSE, warning=FALSE}
+SRSq_associated_genes <- read.table("../results/differential_gene_expression/GAinS/GAinS-RNAseq_DEGs_SRSq_limma_extended-signature.tsv",
+                                    sep="\t", header=T)
+```
+
+We next use limma to test for an association between SRSq and protein abundance in the CyTOF data set. 
+```{r test_for_differential_abundance, message=FALSE, warning=FALSE}
+# Defining model matrix
+design_matrix <- model.matrix(~COMBAT_CyTOF$SRSq)
+
+# Fitting data to model
+fit <- lmFit(assay(COMBAT_CyTOF), design_matrix)
+fit2 <- contrasts.fit(fit, coef = 2)
+fit2 <- eBayes(fit2)
+
+# Extracting coefficients and p-values
+DAPs <- topTable(fit2, adjust="BH", number = nrow(COMBAT_CyTOF))
+DAPs$cytof_id <- rownames(DAPs)
+DAPs$gene_name <- cytof_gene_mappings[DAPs$cytof_id,]$gene_name
+```
+
+The distribution of log-fold change in the CyTOF data is as follows:
+```{r plot_protein_LFC_histogram, message=FALSE, warning=FALSE, echo=FALSE}
+hist(DAPs$logFC, breaks=30, xlab="Log-fold change", main="SRSq-associated protein abundance changes")
+abline(v = 0.5)
+abline(v = -0.5)
+```
+
+Based on this distribution, we defined proteins as significnatly associated with SRSq if they show a |LFC| > 0.5 at an FDR of 0.05.
+```{r define_differentially_abundant_proteins, message=FALSE, warning=FALSE}
+DAPs$DA <- DAPs$adj.P.Val <= 0.05 & abs(DAPs$logFC) > 0.5
+```
+
+We can now compare these reuslts with those obtained from RNA-seq, so as to determine if genes tend to show the same direction of effects at the RNA and protein level. We begin by creating a "joint" data set containing both measurement types:
+```{r create_joint_dataset, message=FALSE, warning=FALSE}
+shared_DEGs <- intersect(DAPs$gene_name, SRSq_associated_genes$gene_name)
+
+DAPs_s <- DAPs[DAPs$gene_name %in% shared_DEGs,]
+rownames(DAPs_s) <- DAPs_s$gene_name
+
+DEGs_s <- SRSq_associated_genes[SRSq_associated_genes$gene_name %in% shared_DEGs,]
+rownames(DEGs_s) <- DEGs_s$gene_name
+
+DEGs_s <- DEGs_s[rownames(DAPs_s),]
+
+DEG_comparison <- data.frame(
+  gene_name = DAPs_s$gene_name,
+  cytof_name = DAPs_s$cytof_id,
+  protein_LFC = DAPs_s$logFC,
+  RNA_LFC = DEGs_s$logFC,
+  DEP = DAPs_s$DA,
+  DEG = DEGs_s$DE
+)
+```
+
+
+The direction of effects indeed tends to be the same across all genes (CD45R being the only exception).
+```{r plot_SRSq_associations_RNA_vs_protein, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(DEG_comparison, aes(x=RNA_LFC, y=protein_LFC)) +
+  geom_hline(yintercept = 0, linetype="dashed") +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  geom_smooth(method="lm") +
+  geom_point(aes(color=DEP), size=3) +
+  xlab("Log fold change (RNA-seq)") +
+  ylab("Log fold change (CyTOF)") +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  geom_label_repel(data=DEG_comparison[DEG_comparison$DEP,],aes(label=cytof_name)) +
+  stat_cor() +
+  theme_classic()
+```
+
+Below are some examples of protein-SRSq associations, corresponding to the top proteins most strongly associated with SRSq, as well as the outlier CD45.
+```{r plot_SRSq_protein_association_examples, message=FALSE, warning=FALSE, echo=FALSE}
+joint_dataset$Source <- COMBAT_CyTOF$Source
+joint_dataset$SRS <- COMBAT_CyTOF$SRS
+joint_dataset$SRSq <- COMBAT_CyTOF$SRSq
+
+g1 <- ggplot(joint_dataset, aes(x=SRSq, y=CEACAM1_protein)) +
+  geom_smooth(method="lm") +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  xlab("SRSq") +
+  ylab("CD66 (CyTOF average)") +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "none")
+g1 <- ggMarginal(g1, groupFill = T)
+
+
+g2 <- ggplot(joint_dataset, aes(x=SRSq, y=CD3G_protein)) +
+  geom_smooth(method="lm") +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  xlab("SRSq") +
+  ylab("CD3 (CyTOF average)") +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "none")
+g2 <- ggMarginal(g2, groupFill = T)
+
+
+g3 <- ggplot(joint_dataset, aes(x=SRSq, y=CD99_protein)) +
+  geom_smooth(method="lm") +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  xlab("SRSq") +
+  ylab("CD99 (CyTOF average)") +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "none")
+g3 <- ggMarginal(g3, groupFill = T)
+
+g4 <- ggplot(joint_dataset, aes(x=SRSq, y=PTPRC_protein)) +
+  geom_smooth(method="lm") +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  xlab("SRSq") +
+  ylab("CD45 (CyTOF average)") +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "none")
+g4 <- ggMarginal(g4, groupFill = T)
+
+plot_grid(g1,g2,g3,g4,ncol=2,nrow=2)
+```
+## R session
+```{r R_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```
+

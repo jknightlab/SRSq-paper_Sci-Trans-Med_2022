@@ -1,0 +1,110 @@
+---
+title: Exploratory data analysis of sepsis whole blood transcriptomes from the MARS cohort
+  cohort
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(SummarizedExperiment)
+library(annotables)
+```
+
+## Loading data
+Microarray data
+```{r load_data, message=FALSE, warning=FALSE}
+mars_gex <- read.csv("/well/jknight/justin/sepsis/mars/mars_all_expression.csv", header = T, row.names = 1)
+mars_metadata <- read.csv("../data/mars_gex/MARS-full-metadata_GEO.csv", header=T, row.names = 1)
+```
+
+Affymetrix probe annotations
+```{r load_probe_annotations, message=FALSE, warning=FALSE}
+probe_annotations <- read.csv("/well/jknight/justin/sepsis/mars/affymetrix_human_gene_u219_array_metadata.csv", header=T, row.names = 1)
+```
+
+## Pre-processing data
+Finding genes in study
+```{r find_genes_in_study, message=FALSE, warning=FALSE}
+probe_annotations <- probe_annotations[rownames(mars_gex),]
+genes_in_study <- unique(probe_annotations$Symbol)
+```
+
+Collapsing probe measurements per gene
+```{r collapse_probes_per_gene, message=FALSE, warning=FALSE}
+mars_gex_per_gene <- sapply(genes_in_study, FUN=function(gene){
+  probe_ids <- rownames(probe_annotations)[probe_annotations$Symbol == gene]
+  mean_gene_exp <- colMeans(mars_gex[probe_ids,])
+  return(mean_gene_exp)
+})
+
+mars_gex_per_gene <- data.frame(t(mars_gex_per_gene))
+```
+
+Removing probes mapping to multiple genes
+```{r remove_multimapping_probes, message=FALSE, warning=FALSE}
+mars_gex_per_gene <- mars_gex_per_gene[!grepl("///",rownames(mars_gex_per_gene)),]
+```
+
+Creating gene annotations
+```{r create_gene_annotations, message=FALSE, warning=FALSE}
+gene_annotations <- probe_annotations[probe_annotations$Symbol %in% rownames(mars_gex_per_gene),c("Symbol","Ensembl.Entrez.Gene","chrom")]
+gene_annotations <- gene_annotations[!duplicated(gene_annotations$Symbol),]
+
+colnames(gene_annotations) <- c("gene_name","gene_id","chr")
+rownames(gene_annotations) <- gene_annotations$gene_name
+
+gene_annotations$chr <- gsub("chr","",gene_annotations$chr)
+gene_annotations <- gene_annotations[rownames(mars_gex_per_gene),]
+```
+
+Creating a summarized experiment object with expression values, sample metadata, and gene annotations
+```{r create_summarized_experiment, message=FALSE, warning=FALSE}
+mars <- SummarizedExperiment(assays = mars_gex_per_gene, 
+                             rowData = gene_annotations, 
+                             colData = mars_metadata)
+
+mars
+```
+
+## Exploratory data analysis
+Performing principal component analysis
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca_mars <- prcomp(t(assay(mars)))
+
+pc_coords_mars <- data.frame(cbind(pca_mars$x),colData(mars))
+```
+
+
+Visualising the distribution of samples belonging to different MARS endotypes in PCA space.
+```{r plot_pca, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords_mars, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=Endotype_cohort), size=3) +
+  theme_classic()
+
+ggplot(pc_coords_mars, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=Endotype_class), size=3) +
+  theme_classic()
+
+ggplot(pc_coords_mars, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=Group), size=3) +
+  theme_classic()
+```
+
+## Exporting results
+Exporting summarized experiment object as an R data set.
+```{r export_data, eval=FALSE}
+saveRDS(mars, "../data/mars_gex/mars_microarray_averaged-by-gene.rds")
+```
+
+## R session
+```{r r_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```
+

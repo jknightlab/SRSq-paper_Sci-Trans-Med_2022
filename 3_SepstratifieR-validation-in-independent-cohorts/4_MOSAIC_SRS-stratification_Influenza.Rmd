@@ -1,0 +1,616 @@
+---
+title: "Exploratory analysis and patient stratification using whole blood gene expression data from an Influenza cohort"
+author: "Eddie Cano-Gamez"
+date: "07/09/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This markdown contains the pre-processing and exploratory data analysis of a publicly available microarray data set of whole blood from Inlfluenza patients recruited as a part of the "Mechanisms of Severe Acute Influenza Consortium" MOSAIC study. 
+
+RNA was extracted from whole blood of 109 adult patients diagnosed with Influenza and healthy controls using Tempus tubes and the MagMAX-96 blood RNA isolation system. Gene epxression quantification was then performed using an Illumina HumanHT12 v4 microarray. For more details on the generation and processing of this data set, refer to the 2018 Nature Immunology publication by Dunning et al:
+
+https://doi.org/10.1038/s41590-018-0111-5
+
+## Loading libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(FSA)
+library(SummarizedExperiment)
+library(illuminaHumanv4.db)
+library(limma)
+library(SepstratifieR)
+library(XGR)
+library(ggrepel)
+library(gprofiler2)
+library(cowplot)
+library(ggExtra)
+library(ggpubr)
+```
+
+## Loading data
+Microarray data:
+```{r load_data, message=FALSE, warning=FALSE}
+MOSAIC_gex <- read.table("../data/MOSAIC/MOSAIC_gex_normalised-log-transformed.txt", 
+                         sep="\t", header=T, row.names = 1)
+```
+
+Study metadata:
+```{r load_metadata, message=FALSE, warning=FALSE}
+MOSAIC_metadata <- read.table("../data/MOSAIC/MOSAIC_metadata.txt",
+                              sep="\t", header=T)
+
+rownames(MOSAIC_metadata) <- MOSAIC_metadata$sample_id
+```
+
+
+Illumina HumanHT probe mappings:
+```{r load_IlluminaHumanHT_probe_mappings, message=FALSE, warning=FALSE}
+probe_annotations <- read_tsv("../data/MOSAIC/HumanHT-12_V4_0_R1_15002873_B_probe-annotations.txt")
+
+probe_annotations<- probe_annotations[,c("Transcript","ILMN_Gene","Symbol","Probe_Id","Chromosome")]
+```
+
+## Collapsing probe measurements by gene
+We start by removing any probes not detected in the study from the annotation table
+```{r subset_probes, message=FALSE, warning=FALSE}
+probe_annotations <- probe_annotations[probe_annotations$Probe_Id %in% rownames(MOSAIC_gex),]
+```
+
+We then identify all genes present in the study
+```{r list_genes_in_study, message=FALSE, warning=FALSE}
+genes_in_study <- unique(probe_annotations$ILMN_Gene)
+```
+
+We can now collapse probe measurements at the gene level (i.e. average the measurements from all probes mapping to a given gene)
+```{r collapse_probes_per_gene, message=FALSE, warning=FALSE}
+MOSAIC_gex_per_gene <- sapply(genes_in_study, FUN = function(gene){
+  probe_ids <- as.character(probe_annotations$Probe_Id[probe_annotations$ILMN_Gene==gene])
+  mean_expression <- colMeans(MOSAIC_gex[probe_ids,])
+  return(mean_expression)
+})
+MOSAIC_gex_per_gene <- data.frame(t(MOSAIC_gex_per_gene))
+```
+
+## Creating a gene annotation table
+Fetching the Ensembl ID for each probe which passed QC based on the gene it maps to.
+```{r map_probes_to_ensembl_ids, message=FALSE, warning=FALSE}
+probe2ensembl <- as.list(
+  illuminaHumanv4ENSEMBL[intersect(probe_annotations$Probe_Id, mappedkeys(illuminaHumanv4ENSEMBL))]
+)
+
+ensembl_ids <- c()
+for(i in probe_annotations$Probe_Id){
+  if(i %in% names(probe2ensembl)){
+    gene_id <- probe2ensembl[[i]][[1]]
+  } else{
+    gene_id <- NA
+  }
+  ensembl_ids <- c(ensembl_ids, gene_id)
+}
+probe_annotations$Ensembl_ID <- ensembl_ids
+```
+
+Fetching annotations for all genes in the study
+```{r fetch_gene_annotations, message=FALSE, warning=FALSE}
+gene_annotations <- data.frame(probe_annotations[!duplicated(probe_annotations$ILMN_Gene),
+                                                 c("ILMN_Gene","Ensembl_ID","Chromosome","Symbol")])
+rownames(gene_annotations) <- gene_annotations$ILMN_Gene
+```
+
+## Creating a Summarized Experiment objetct
+Creating a SummarizedExperiment containing expression values per gene and gene annotations.
+```{r create_summarized_experiment, message=FALSE, warning=FALSE}
+MOSAIC <- SummarizedExperiment(assays = MOSAIC_gex_per_gene,
+                               colData = MOSAIC_metadata,
+                               rowData = gene_annotations)
+
+MOSAIC
+```
+
+## Sample filtering
+We perform principal component analysis (PCA) based on all genes to assess if any samples are outlying.
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca_res <- prcomp(t(assay(MOSAIC)))   
+```
+
+Fetching PCA coordinates and the variance explained by each component.
+```{r fetch_pc_coords, message=FALSE, warning=FALSE}
+pc_coords <- data.frame(cbind(pca_res$x,colData(MOSAIC)))
+pc_vars <- pca_res$sdev^2/sum(pca_res$sdev^2)
+```
+
+The scree plot below shows the amount of variance captured by each of the first 40 principal components.
+```{r plot_variance_explained_per_pc, message=FALSE, warning=FALSE, echo=FALSE}
+plot(pc_vars[1:50], 
+     type="b", cex=0.5, 
+     xlab="Principal Component", 
+     ylab="Proportion of variance explained")
+```
+
+PCA reveals one clearl outlier.
+```{r plot_pca, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(color="darkgrey", size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+We thus remove the outlying sample.
+```{r remove_outliers, message=FALSE, warning=FALSE}
+MOSAIC <- MOSAIC[,pc_coords$PC2 > -200]
+```
+
+## Dimensionality reduction and visualisation
+We now repeat the principal component analysis (PCA) calculation based on all genes for the clean set of samples.
+```{r perform_pca_2, message=FALSE, warning=FALSE}
+pca_res <- prcomp(t(assay(MOSAIC)))   
+```
+
+```{r fetch_pc_coords_2, message=FALSE, warning=FALSE}
+pc_coords <- data.frame(cbind(pca_res$x,colData(MOSAIC)))
+pc_vars <- pca_res$sdev^2/sum(pca_res$sdev^2)
+```
+
+The scree plot is comparable to that obtained before.
+```{r plot_variance_explained_per_pc_2, message=FALSE, warning=FALSE, echo=FALSE}
+plot(pc_vars[1:50], 
+     type="b", cex=0.5, 
+     xlab="Principal Component", 
+     ylab="Proportion of variance explained")
+```
+
+Now that the outlier has been removed, we see a certain degree of separationby severity of Influenza.
+```{r plot_pca_by_severity, message=FALSE, warning=FALSE, echo=FALSE}
+pc_coords$T1_severity <- factor(pc_coords$T1_severity, levels=c("HC","1","2","3"))
+g1 <- ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=T1_severity), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  scale_color_manual(values=c("lightgrey","#fed98e","#fe9929","#993404"), 
+                     name="Severity",
+                     labels=c("Healthy","Influenza (No oxygen)", "Influenza (Oxygen mask)", "Influenza (Mechanical ventilation)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "bottom", 
+        legend.justification = "centre",
+        legend.text = element_text(size=8),
+        legend.title = element_blank())
+ggMarginal(g1, type = "density", groupFill = T)
+```
+
+It is also apparent that samples from the last time point (T3, which corresponds to > 4 weeks after the first sample was collected) tend to be closer transcriptionaly to the healthy volunteer group used as controls.
+```{r plot_pca_by_timepoint, message=FALSE, warning=FALSE, echo=FALSE}
+pc_coords$T1_severity <- factor(pc_coords$T1_severity, levels=c("HC","1","2","3"))
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=time_point), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+
+While there seems to be no separation by other demographic covariates such as sex, age, or ethnicity, PC2 does to a certain extent separate samples with detected bacterial co-infection from those with Influenza only, particularly during the first and second time points.
+```{r plot_pca_by_covarites, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=ethnicity), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=sex), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=age), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=bacterial_status), size=3) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+## Sample stratification into SRS groups
+We now assign each of these samples as SRS group and a quantitative SRSq score using the functions in the SepstratifieR package.
+
+Let's first define the set of 7 SRS-predictive genes
+```{r define_SRS_predictors, message=FALSE, warning=FALSE}
+extended_predictors <- read.table("../results/extended-predictor-gene-set.tsv", sep="\t", header=T)
+```
+
+We then extract these genes from the data set
+```{r extract_predictor_genes, message=FALSE, warning=FALSE}
+MOSAIC_predictors <- data.frame(t(assay(MOSAIC[extended_predictors$ILMN_gene,])))
+colnames(MOSAIC_predictors) <- extended_predictors$gene_id
+
+head(MOSAIC_predictors)
+```
+
+We can now apply the stratification algorithm to this data.
+```{r stratify_samples, message=FALSE, warning=FALSE}
+SRS_predictions <- stratifyPatients(MOSAIC_predictors, 
+                                    gene_set = "extended",
+                                    k=round(nrow(MOSAIC_predictors)*0.3))
+```
+
+The frequency of SRS groups in this cohort is as follows:
+```{r tabulate_SRS_frequencies, message=FALSE, warning=FALSE}
+table(SRS_predictions@SRS)
+```
+
+Encouragingly, the samples in the MOSAIC cohort seem well aligned with the reference used by SepstratifieR.
+```{r plot_sample_alignment, message=FALSE, warning=FALSE}
+plotAlignedSamples(SRS_predictions)
+```
+
+Further, we see no outliers compared to the reference along any of the 7 principal components derived using the genes used for classification.
+```{r plot_sample_alignment_by_mNN_outlier, message=FALSE, warning=FALSE}
+outlier_plots <- list()
+for(i in 2:7){
+ outlier_plots[[i-1]] <- plotAlignedSamples(SRS_predictions, color_by = "mNN_outlier", pcs = c(1,i))
+}
+
+plot_grid(plotlist = outlier_plots, ncol=2, nrow=3)
+```
+
+The predicted sepsis scores (SRSq) are also relatively robust to the choice of 'k'.
+```{r run_sensititivy_analysis, message=FALSE, warning=FALSE}
+sensitivity_res <- runSensitivityAnalysis(MOSAIC_predictors, gene_set = "extended")
+```
+
+We thus add the predictions from SepstratifieR as metadata to the Summarized Experiment object.
+```{r add_SRS_to_metadata, message=FALSE, warning=FALSE}
+MOSAIC$SRS <- SRS_predictions@SRS
+MOSAIC$SRSq <- SRS_predictions@SRSq
+
+pc_coords <- data.frame(cbind(pca_res$x,colData(MOSAIC)))
+```
+
+
+## Correlation between SRS groups and Influenza severity
+Let's now assess whether the predicted SRS labels correlate with Influenza severity. 
+
+PCA reveals that the SRS signature correlates with severity, as captured by the first principal component.
+```{r plot_pca_by_SRS, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(data=pc_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  theme_classic() +
+  xlim(-50,100) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "bottom", 
+        legend.justification = "centre",
+        legend.text = element_text(size=8),
+        legend.title = element_blank())
+ggMarginal(g1, type = "density", groupFill = T)
+
+ggplot(data=pc_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=SRSq), size=3) +
+  xlim(-50,100) +
+  scale_color_gradient2(low = "lightgrey", mid = "steelblue", high = "darkblue", midpoint = 0.5) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "bottom", 
+        legend.justification = "centre",
+        legend.text = element_text(size=8),
+        legend.title = element_blank())
+```
+
+To confirm this, we visualise the distribution of quantitative SRSq scores within each severity group. There is an association between these two variables.
+```{r plot_SRSq_vs_severity, message=FALSE, warning=FALSE, echo=FALSE}
+pc_coords$T1_severity <- gsub("3","Influenza (mechanical ventilation)",gsub("2","Influenza (oxygen mask)",gsub("1","Influenza (no oxygen)",gsub("HC","Healthy",pc_coords$T1_severity))))
+pc_coords$T1_severity <- factor(pc_coords$T1_severity, levels=c("Healthy", 
+                                       "Influenza (no oxygen)", "Influenza (oxygen mask)", "Influenza (mechanical ventilation)"))
+pc_coords$time_point_n <- gsub("HC",1,gsub("^T","",pc_coords$time_point))
+
+ggplot(data=pc_coords, aes(x=T1_severity, y=SRSq)) +
+  geom_boxplot() +
+  geom_jitter(aes(color=SRS), width=0.1, size=2, alpha=0.8) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) + 
+  theme_classic() +
+  stat_compare_means() +
+  theme(axis.title.y = element_blank(),
+        legend.position = "bottom")
+
+kruskal.test(SRSq ~ T1_severity, data = pc_coords)
+dunnTest(SRSq ~ T1_severity,
+         data=pc_coords,
+         method="bonferroni")
+```
+
+```{r plot_SRSq_vs_severity_stratified_by_time_point, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(data=pc_coords[pc_coords$time_point != "HC",], aes(y=SRSq, x=time_point)) +
+  geom_boxplot() +
+  geom_jitter(aes(color=SRS), width=0.1, size=2, alpha=0.8) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) + 
+  facet_grid(~T1_severity) +
+  theme_bw() +
+  stat_compare_means() +
+  theme(axis.title.y = element_blank(), 
+        panel.grid = element_blank(), 
+        legend.position = "bottom")
+```
+
+
+Finally, we assess whether SRSq scores tend to change over time for individuals with Influenza infection sampled at multiple time points post infection. We observe that SRSq scores tend to decrease as individuals recover across all disease severities, with many individuals already showing lower scores after 2 days (T2), and most of them returning to the baseline levels of a healthy population after > 4 weeks (T3).
+```{r plot_SRSq_vs_time_point, message=FALSE, warning=FALSE}
+pc_coords$sample_name_short <- gsub("_[A-Z0-9]+$","",pc_coords$title)
+pc_coords$SRS_at_first_time_point <- sapply(pc_coords$sample_name_short, FUN=function(i){
+  dat <- pc_coords[pc_coords$sample_name_short == i,c("time_point","SRS")]
+  dat <- dat[order(dat$time_point),]
+  first_srs <- dat$SRS[1]
+  
+  return(first_srs)
+})
+
+ggplot(data=pc_coords[pc_coords$time_point != "HC",], aes(x=time_point, y=SRSq)) +
+  geom_line(aes(group=sample_name_short, color=SRS_at_first_time_point), alpha=0.85) +
+  geom_point(aes(color=SRS), size=2) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+## Identifying SRS-associated gene expression programs
+Let's now use limma to identify genes whose expression levels are associated with SRSq.
+
+We start by defining a model matrix, with SRS/SRSq as the independent variable. 
+```{r define_design_matrix, message=FALSE, warning=FALSE}
+# SRS
+SRS_labels <- factor(MOSAIC$SRS, levels = c("SRS1","SRS2","SRS3"))
+design_matrix_SRS <- model.matrix( ~ 0 + SRS_labels)
+colnames(design_matrix_SRS) <-c("SRS1","SRS2","SRS3")
+
+# SRSq
+design_matrix_SRSq <- model.matrix(~MOSAIC$SRSq)
+```
+
+We then test for an association between gene expression level and SRSq using limma.
+```{r test_for_differential_expression, message=FALSE, warning=FALSE}
+# SRS
+fit_SRS <- lmFit(assay(MOSAIC), design_matrix_SRS)
+contrast_matrix_SRS <- makeContrasts(SRS1-SRS2, levels=design_matrix_SRS)
+
+fit2_SRS <- contrasts.fit(fit_SRS, contrast_matrix_SRS)
+fit2_SRS <- eBayes(fit2_SRS)
+
+# SRSq
+fit_SRSq <- lmFit(assay(MOSAIC), design_matrix_SRSq)
+
+fit2_SRSq <- contrasts.fit(fit_SRSq, coef = 2)
+fit2_SRSq <- eBayes(fit2_SRSq)
+```
+
+Finally, we retrieve the relevant statistics for any differentially expressed genes from limma's fit objects.We define differentially expressed genes as |fold change| >= 3.5 at an FDR <= 0.05. A fold-change of 3.5 is approximately equivalent to a 1-fold increase in gene expression for every 0.3-unit increase in SRSq. 
+```{r extract_DE_genes, message=FALSE, warning=FALSE}
+# SRS
+DEGs_SRS <- topTable(fit2_SRS, adjust="BH", number = nrow(MOSAIC))
+DEGs_SRS$gene_name <- rownames(DEGs_SRS)
+DEGs_SRS$gene_id <- rowData(MOSAIC)[DEGs_SRS$gene_name,]$Ensembl_ID
+DEGs_SRS$DE <- abs(DEGs_SRS$logFC) >= log2(1.5) & DEGs_SRS$adj.P.Val <= 0.05
+
+# SRSq
+DEGs_SRSq <- topTable(fit2_SRSq, adjust="BH", number = nrow(MOSAIC))
+DEGs_SRSq$gene_name <- rownames(DEGs_SRSq)
+DEGs_SRSq$gene_id <- rowData(MOSAIC)[DEGs_SRSq$gene_name,]$Ensembl_ID
+DEGs_SRSq$DE <- abs(DEGs_SRSq$logFC) >= log2(3.5) & DEGs_SRSq$adj.P.Val <= 0.05
+```
+
+A volcano plot representation of differentialy expressed genes looks as follows:
+```{r create_volcano_plot, message=FALSE, warning=FALSE, echo=FALSE}
+# SRS
+top_genes_SRS <- c(rownames(DEGs_SRS[DEGs_SRS$DE==T & DEGs_SRS$logFC > 0,])[1:15],
+                    rownames(DEGs_SRS[DEGs_SRS$DE==T & DEGs_SRS$logFC < 0,])[1:10])
+
+ggplot(DEGs_SRS, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRS, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRS[top_genes_SRS,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle("SRS-associated genes") +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+
+# SRSq
+top_genes_SRSq <- c(rownames(DEGs_SRSq[DEGs_SRSq$DE==T & DEGs_SRSq$logFC > 0,])[1:15],
+                    rownames(DEGs_SRSq[DEGs_SRSq$DE==T & DEGs_SRSq$logFC < 0,])[1:10])
+
+ggplot(DEGs_SRSq, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRSq, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRSq[top_genes_SRSq,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle("SRSq-associated genes\n") +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+```
+
+Below are some example genes known to be differentially expressed between SRS groups in GAinS.
+```{r create_volcano_plot_example_genes, message=FALSE, warning=FALSE, echo=FALSE}
+example_genes <- c("EMR3","GZMK","CD27","GZMH","CCR3","HLA-DMB","HLAC","CD6","CD177","MMP8","HPGD","TDRD9","GPR84","TNFAIP8L3")
+
+# SRS
+ggplot(DEGs_SRS, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRS, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRS[DEGs_SRS$gene_name %in% example_genes,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle("SRS-associated genes\n") +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+
+# SRSq
+ggplot(DEGs_SRSq, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRSq, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRSq[example_genes,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle("SRSq-associated genes") +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+```
+
+
+Further, there is a gradual increase in gene expression along SRSq.
+```{r plot_gex_vs_SRSq_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+gains_top_genes <- c("PGS1","GYG1","C19ORF59","WDR75","FAM38A","BMS1")
+cat(mean(DEGs[gains_top_genes,]$adj.P.Val < 0.05)*100,"% of top SRSq-associated genes in GAinS also pass FDR correction in MOSAIC.\n", sep="")
+
+DEGs[gains_top_genes,]
+par(mfrow=c(2,3))
+for(i in gains_top_genes){
+  print(
+    plot(MOSAIC$SRSq,
+     assay(MOSAIC[i,]),
+     col = MOSAIC$SRS,
+     main=i,
+     xlab="SRSq",
+     ylab="Log-transformed expression",
+     pch=19)
+  )
+}
+```
+
+Let's compare these fold-change estimates with those calculated in the GAinS cohort.
+```{r load_gains_LFCs, message=FALSE, warning=FALSE}
+DEGs_gains <- read.table("../results/differential_gene_expression/GAinS/GAinS-microarray_DEGs_SRSq_limma_extended-signature.tsv", sep="\t", header=T)
+
+rownames(DEGs_gains) <- DEGs_gains$gene_name
+```
+
+```{r find_shared_genes, message=FALSE, warning=FALSE}
+shared_genes <- intersect(rownames(DEGs_gains), rownames(DEGs_SRSq))
+```
+
+```{r compute_LFC_corelation, message=FALSE, warning=FALSE}
+cor_res <- cor.test(DEGs_gains[shared_genes,]$logFC, DEGs_SRSq[shared_genes,]$logFC)
+cor_res
+```
+
+
+Approximately 14,000 genes are detected in both studies and there is a significant correlation between SRSq-associated log-fold changes in both studies. 
+
+This correlation looks as follows:
+```{r plot_LFC_correlation, message=FALSE, warning=FALSE, echo=FALSE}
+plot(DEGs_gains[shared_genes,]$logFC,
+     DEGs_SRSq[shared_genes,]$logFC,
+     col="darkgrey",
+     pch=19,
+     xlab="Log-fold change (GAinS microarray cohort)",
+     ylab="Log-fold change (MOSAIC cohort)",
+     main=paste("Cor =", round(cor_res$estimate,2), "\np < 2.2e-16"))
+```
+
+Let's export these results as a text file for future reference.
+```{r export_DE_genes, eval=FALSE}
+# SRSq
+write.table(DEGs_SRS[order(-DEGs_SRS$logFC),], 
+            file = "../results/differential_gene_expression/MOSAIC/MOSAIC_DEGs_SRS1-vs-SRS2_limma_extended-signature.tsv",
+            quote = F, row.names = F, sep="\t")
+
+# SRSq
+write.table(DEGs_SRSq[order(-DEGs_SRSq$logFC),], 
+            file = "../results/differential_gene_expression/MOSAIC/MOSAIC_DEGs_SRSq_limma_extended-signature.tsv",
+            quote = F, row.names = F, sep="\t")
+```
+
+### Pathway enrichment analysis
+Next, let's assess whether genes positively or negatively associated with SRSq are enriched in any relevant biological pathways. We use the XGR method to test for enrichment in REACTOME pathways.
+```{r run_XGR, eval=FALSE}
+# Upregulated genes
+XGR_up <- xEnricherGenes(data=DEGs_SRSq$gene_name[DEGs_SRSq$DE & DEGs_SRSq$logFC > 0],
+                         background = DEGs_SRSq$gene_name,
+                         ontology="	MsigdbC2REACTOME")
+
+# Downregulated genes
+XGR_down <- xEnricherGenes(data=DEGs_SRSq$gene_name[DEGs_SRSq$DE & DEGs_SRSq$logFC < 0], 
+                                       background = DEGs_SRSq$gene_name,
+                                       ontology="MsigdbC2REACTOME")
+```
+
+```{r load_XGR_results, warning=FALSE, message=FALSE, echo=FALSE}
+load("../results/differential_gene_expression/MOSAIC/XGR-results-MOSAIC_extended-signature.rdata")
+```
+
+We then subset these results to include only significantly-enriched biological terms.
+```{r format_XGR_results, warning=FALSE, message=FALSE}
+## Reformatting results table
+XGR_up <- xEnrichViewer(XGR_up, top_num=length(XGR_up$adjp), sortBy="fc", details=TRUE)
+XGR_down <- xEnrichViewer(XGR_down, top_num=length(XGR_down$adjp), sortBy="fc", details=TRUE)
+
+## Keeping only significantly enriched pathways
+XGR_up <- XGR_up[XGR_up$adjp <= 0.05,]
+XGR_down <- XGR_down[XGR_down$adjp <= 0.05,]
+```
+
+In order to simplify the full output, we will focus exclusively on pathways matching at least one word in a bank of common immune terms.
+```{r define_immune_terms, message=FALSE, warning=FALSE}
+immune_terms <- c("NOTCH","TLR","Interleukin","NFk","MHC","(m|M)etabolism","Immun","ZAP-70","PD(-)?1","TCR","BCR","CD28","mTORC","SMAD","IFN","TGF","TRAF","Inflam","IRF","CTLA(-)?4","CD3","Interferon")
+```
+
+When assessing pathway enrichment, the results look as follows:
+```{r plot_SRS_associated_pathways, message=FALSE, warning=FALSE, echo=FALSE}
+XGR_up$name <- factor(XGR_up$name, levels=rev(XGR_up$name[order(-XGR_up$or)]))
+ggplot(XGR_up[grepl(paste(immune_terms, collapse="|"), XGR_up$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkred") +
+  geom_hline(yintercept = log2(1), color="darkred", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("Positive enrichment along SRSq") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+
+XGR_down$name <- factor(XGR_down$name, levels=rev(XGR_down$name[order(-XGR_down$or)]))
+ggplot(XGR_down[grepl(paste(immune_terms, collapse="|"), XGR_down$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkblue") +
+  geom_hline(yintercept = log2(1), color="darkblue", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("Negative enrichment along SRSq") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+```
+
+## Saving results
+We can now export the SummarizedExperiment object as an RDS file for future reference.
+```{r export_as_rds, eval=FALSE}
+saveRDS(MOSAIC, "../data/MOSAIC/MOSAIC_gex.rds")
+```
+
+## R session details
+```{r r_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```

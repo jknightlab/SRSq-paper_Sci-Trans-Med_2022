@@ -1,0 +1,178 @@
+---
+title: "Exploratory data analysis of a whole blood microarray data set of healthy individuals in the SHIP-TREND consortium"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This markdown contains the pre-processing and exploratory data analysis of a publicly available microarray data set of whole blood from 991 healthy individuals from the Pomerania region in Germany. These individuals were recruited as a part of the SHIP-TREND consortium.
+
+RNA was extracted from whole blood using the PAXgene Blood RNA System, and gene epxression measurement was performed with an Illumina HumanHT-12 v3 microarray. For more details on the generation and processing of this data set, refer to the SHIP-TREND cohort website or Westra et al.; Nature Genetics:
+
+https://www.nature.com/articles/ng.2756
+
+## Loading libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(SummarizedExperiment)
+library(illuminaHumanv3.db)
+```
+
+## Loading data
+Microarray data:
+```{r load_data, message=FALSE, warning=FALSE}
+ship_trend_gex <- read.table("../data/SHIP-TREND/GSE36382_non_normalized.txt.gz", 
+                             sep="\t", header=T, row.names = 1)
+
+```
+
+Illumina HumanHT probe mappings:
+```{r load_IlluminaHumanHT_probe_mappings, message=FALSE, warning=FALSE}
+probe_annotations <- read_tsv("../data/SHIP-TREND/GPL6947_HumanHT-12_V3_0_R1_11283641_A.bgx.gz", skip=8)
+```
+
+## Filtering probes by detection reliability
+The histogram below shows the number of microarray probes which were reliably detected for every given number of individuals. Here, reliable detection is defined as the probe reaching a detection P value lower or equal than 0.01.
+```{r plot_probes_by_number_of_individual_passing_pval_filter, message=FALSE, warning=FALSE, echo=FALSE}
+hist(rowSums(ship_trend_gex[,grepl("DetectionPvalue",colnames(ship_trend_gex))] < 0.01), 
+     xlab="Number of samples where probe was reliably detected (p value < 0.01)", 
+     ylab="Number of probes", 
+     main="Microarray probes QC")
+```
+
+Based on the distribution shown above, only probes which were reliably detected in at least 200 samples are kept for further analyses.
+```{r remove_unreliable_probes, message=FALSE, warning=FALSE}
+high_quality_probes <- rownames(ship_trend_gex)[rowSums(ship_trend_gex[,grepl("DetectionPvalue",colnames(ship_trend_gex))] < 0.01) > 200]
+
+ship_trend_gex <- ship_trend_gex[high_quality_probes, 
+                                 grep("DetectionPvalue",colnames(ship_trend_gex), invert = T)]
+```
+
+## Log transforming
+We now apply a log2 transformation so as to bring the intensity measurements to a more Gaussian distribution.
+
+```{r log_transform, message=FALSE, warning=FALSE}
+ship_trend_gex <- log2(ship_trend_gex)
+```
+
+## Collapsing probe measurements by gene
+Let's use the probe information file from Illumina to retrieve annotations for all probes that passed QC filters.
+```{r find_probes_in_dataset, message=FALSE, warning=FALSE}
+probe_annotations <- data.frame(filter(probe_annotations, Probe_Id %in% high_quality_probes))
+```
+
+Based on these annotatinos, we then identify all genes present in the study
+```{r list_genes_in_study, message=FALSE, warning=FALSE}
+genes_in_study <- unique(probe_annotations$ILMN_Gene)
+```
+
+We can now collapse probe measurements at the gene level (i.e. average the measurements from all probes mapping to a given gene)
+```{r collapse_probes_per_gene, message=FALSE, warning=FALSE}
+ship_trend_gex_per_gene <- sapply(genes_in_study, FUN = function(gene){
+  probe_ids <- as.character(probe_annotations$Probe_Id[probe_annotations$ILMN_Gene==gene])
+  mean_expression <- colMeans(ship_trend_gex[probe_ids,])
+  return(mean_expression)
+})
+ship_trend_gex_per_gene <- data.frame(t(ship_trend_gex_per_gene))
+```
+
+## Creating a gene annotation table
+Fetching the Ensembl ID for each probe which passed QC based on the gene it maps to.
+```{r map_probes_to_ensembl_ids, message=FALSE, warning=FALSE}
+probe2ensembl <- as.list(
+  illuminaHumanv3ENSEMBL[intersect(probe_annotations$Probe_Id, mappedkeys(illuminaHumanv3ENSEMBL))]
+)
+
+ensembl_ids <- c()
+for(i in probe_annotations$Probe_Id){
+  if(i %in% names(probe2ensembl)){
+    gene_id <- probe2ensembl[[i]][[1]]
+  } else{
+    gene_id <- NA
+  }
+  ensembl_ids <- c(ensembl_ids, gene_id)
+}
+probe_annotations$Ensembl_ID <- ensembl_ids
+```
+
+Fetching annotations for all genes in the study
+```{r fetch_gene_annotations, message=FALSE, warning=FALSE}
+gene_annotations <- probe_annotations[!duplicated(probe_annotations$ILMN_Gene), c("ILMN_Gene","Ensembl_ID","Chromosome","Source","RefSeq_ID","Symbol","Protein_Product")]
+rownames(gene_annotations) <- gene_annotations$ILMN_Gene
+```
+
+## Creating a Summarized Experiment objetct
+Creating a SummarizedExperiment containing expression values per gene and gene annotations.
+```{r create_summarized_experiment, message=FALSE, warning=FALSE}
+SHIP_TREND <- SummarizedExperiment(assays = ship_trend_gex_per_gene,
+                                   rowData = gene_annotations)
+```
+
+## Dimensionality reduction and visualisation
+Inspecting the relationship between expression variance and expression level.
+```{r estiamte_gene_variances, message=FALSE, warning=FALSE}
+gene_variances <- data.frame(mean_expression = rowMeans(assay(SHIP_TREND)),
+                             variance = rowVars(as.matrix(assay(SHIP_TREND))))
+```
+
+```{r find_top_variable_genes, message=FALSE, warning=FALSE}
+gene_variances <- gene_variances[order(-gene_variances$variance),]
+gene_variances$rank <- 1:nrow(gene_variances)
+gene_variances$top_variable <- FALSE
+gene_variances$top_variable[1:1000] <- TRUE
+gene_variances <- gene_variances[rownames(SHIP_TREND),]
+```
+
+```{r plot_variance_vs_expression, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(gene_variances, aes(x=mean_expression, y=variance)) + 
+  geom_point(aes(color=top_variable), size=0.75) +
+  scale_color_manual(values=c("#8da0cb","#fc8d62")) +
+  xlab("Mean expression") +
+  ylab("Variance in expression") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Performing principal component analysis (PCA) based on all genes.
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca_ship_trend <- prcomp(t(assay(SHIP_TREND)))   
+```
+
+Fetching PCA coordinates and the variance explained by each component.
+```{r fetch_pc_coords, message=FALSE, warning=FALSE}
+pc_coords_ship_trend <- data.frame(cbind(pca_ship_trend$x,colData(SHIP_TREND)))
+pc_variance_ship_trend <- pca_ship_trend$sdev^2/sum(pca_ship_trend$sdev^2)
+```
+
+As shown by the scree plot below, most variance is captured by the first principal component.
+```{r plot_variance_explained_per_pc, message=FALSE, warning=FALSE, echo=FALSE}
+plot(pc_variance_ship_trend[1:50], 
+     type="b", cex=0.5, 
+     xlab="Principal Component", 
+     ylab="Proportion of variance explained")
+```
+
+The samples in this study look as follows in PCA space. There seems to be some degree of heterogeneity, with two clear groups of smaples.
+```{r plot_pca, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords_ship_trend, aes(x=PC1, y=PC2)) + 
+  geom_point(size=3) +
+  xlab(paste("PC1 (", round(pc_variance_ship_trend[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance_ship_trend[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Exporting data set
+Finally, the SummarizedExperiment object containing this data is exported as an RDS file.
+```{r export_as_rds, eval=FALSE}
+saveRDS(SHIP_TREND, "../data/SHIP-TREND/SHIP-TREND_microarray_averaged-per-gene.rds")
+```
+
+## R session details
+```{r r_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```

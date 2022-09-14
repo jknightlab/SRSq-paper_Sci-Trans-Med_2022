@@ -1,0 +1,1129 @@
+---
+title: "Stratification of patients by sepsis response signature (SRS) in the MARS cohort"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading libraries
+```{r load_libraries, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(reshape2)
+library(SummarizedExperiment)
+library(SepstratifieR)
+library(limma)
+library(XGR)
+library(survival)
+library(survminer)
+library(zoo)
+library(RVAideMemoire)
+library(mediation)
+library(ggrepel)
+library(ggExtra)
+library(ggpubr)
+library(cowplot)
+library(UpSetR)
+```
+
+## Loading data
+Loading a validation set containing sepsis samples from the MARS consortium, profiled using an Affymetrix microarray.
+```{r load_mars_data, message=FALSE, warning=FALSE}
+mars <- readRDS("../data/mars_gex/mars_microarray_averaged-by-gene.rds")
+```
+
+Removing samples from paediatric sepsis and samples which overlap with GAinS.
+```{r filter_samples, message=FALSE, warning=FALSE}
+## Keeping only samples in their discovery and validation cohorts
+mars$Endotype_cohort[mars$Group == "Healthy volunteer"] <- "HV"
+mars$Endotype_class[mars$Group == "Healthy volunteer"] <- "HV"
+
+## Removing any samples from the paediatric and GAinS cohorts
+mars <- mars[,!is.na(mars$Endotype_class)]
+```
+
+## Stratifying samples by SRS group
+Defining a variable containing the 7 SRS-predictive genes identified by Davenport et al.
+```{r define_predictor_genes, message=FALSE, warning=FALSE}
+predictor_genes <- read.table("../results/extended-predictor-gene-set.tsv", sep="\t", header=T)
+predictor_genes$Affy_gene <- gsub("ORF","orf",predictor_genes$ILMN_gene)
+```
+
+Extracting predictor genes in the MARS cohort.
+```{r fetch_predictor_variables_mars, message=FALSE, warning=FALSE}
+predictors_mars <- data.frame(t(assay(mars[predictor_genes$Affy_gene,])))
+colnames(predictors_mars) <- predictor_genes$gene_id
+```
+
+Predicting labels and risk scores.
+```{r predict_labels_mars, message=FALSE, warning=FALSE}
+preds_mars <- stratifyPatients(predictors_mars, gene_set = "extended", k=round(0.3*ncol(mars)))
+
+mars$SRS <- preds_mars@SRS
+mars$SRSq <- preds_mars@SRSq
+```
+
+The proportion of SRS groups in this cohort is as follows:
+```{r tabulate_SRS_labels, message=FALSE, warning=FALSE}
+table(mars$SRS)
+```
+
+```{r plot_sample_alignment, message=FALSE, warning=FALSE}
+plotAlignedSamples(preds_mars)
+```
+
+```{r run_sensitivity_analysis, message=FALSE, warning=FALSE}
+sensitivity_res <- runSensitivityAnalysis(predictors_mars, gene_set = "extended", verbose = F)
+```
+
+Plotting predictor genes per SRS group
+```{r plot_predictor_genes_per_sample, message=FALSE, warning=FALSE, echo=FALSE}
+predictor_gene_levels <- predictors_mars
+colnames(predictor_gene_levels) <- predictor_genes$gene_name
+
+row_annotations <- data.frame(SRS=preds_mars@SRS, 
+                              SRSq=preds_mars@SRSq,
+                              MARS = mars$Endotype_class,
+                              death = as.factor(mars$Mortality_event_28days),
+                              cohort=mars$Endotype_cohort,
+                              shock=as.factor(mars$septic_shock),
+                              row.names = rownames(predictor_gene_levels))
+
+
+pheatmap::pheatmap(predictor_gene_levels, 
+                   show_rownames = F,
+                   annotation_row = row_annotations, 
+                   color = colorRampPalette(c("darkblue","lightgrey","darkred"))(100),
+                   annotation_colors = list(SRS=c(SRS1="darkred",SRS2="steelblue",SRS3="darkblue"),
+                                            cohort=c(discovery="#fc8d62",validation="#8da0cb",HV="grey"),
+                                            shock=c("1"="darkblue","0"="white"),
+                                            death=c("1"="darkblue","0"="white")))
+```
+
+
+### Differential expression analysis
+We next perform differential expression analysis between SRS groups. We start by defining a model design matrix with limma. This matrix specifies which samples fall into the SRS1, SRS2, or SRS3 groups.
+```{r define_limma_design_matrix, message=FALSE, warning=FALSE}
+SRS_groups <-factor(mars$SRS, levels=c("SRS1","SRS2","SRS3")) 
+
+design_matrix <- model.matrix( ~ 0 + SRS_groups)
+colnames(design_matrix) <-c("SRS1","SRS2","SRS3")
+```
+
+Next, I use limma to estimate variances and fits based on the design matrix.
+```{r test_for_differential_expression, message=FALSE, warning=FALSE}
+fit <- lmFit(assay(mars), design_matrix)
+contrast.matrix <- makeContrasts(SRS1-SRS3, SRS2-SRS3, SRS1-SRS2, levels=design_matrix)
+
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+```
+
+Based on this fit, I can now extract all differentially expressed genes between SRS1 and SRS2. I focus here on the SRS1 vs SRS2 comparison because it has been extensively studied in the GAinS cohort. The resulting fold-change and P value estimates look as follows:
+```{r extract_DE_genes, message=FALSE, warning=FALSE}
+DEGs_SRS1_vs_SRS2 <- topTable(fit2, coef=3, adjust="BH", number = 23179)
+DEGs_SRS1_vs_SRS2$gene_name <- rownames(DEGs_SRS1_vs_SRS2)
+DEGs_SRS1_vs_SRS2$DE <- abs(DEGs_SRS1_vs_SRS2$logFC) >= 0.75 & DEGs_SRS1_vs_SRS2$adj.P.Val <= 0.05
+
+head(DEGs_SRS1_vs_SRS2)
+```
+
+A simple volcano plot visualization reveals the top differentially expressed genes between SRS groups.
+```{r create_volcano_plot, message=FALSE, warning=FALSE, echo=FALSE}
+top_genes <- rownames(DEGs_SRS1_vs_SRS2[DEGs_SRS1_vs_SRS2$DE==T,])[1:20]
+example_genes <- c("EMR3","GZMK","CD27","GZMH","CCR3","HLA-DMB","HLAC","CD6","CD177","MMP8","HPGD","TDRD9","GPR84","TNFAIP8L3")
+
+ggplot(DEGs_SRS1_vs_SRS2, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRS1_vs_SRS2, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRS1_vs_SRS2[top_genes,],
+             aes(label=gene_name, color=DE), size=3.5, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  theme_classic() +
+  theme(legend.position="none")
+
+ggplot(DEGs_SRS1_vs_SRS2, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRS1_vs_SRS2, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRS1_vs_SRS2[rownames(DEGs_SRS1_vs_SRS2) %in% example_genes,],
+             aes(label=gene_name, color=DE), size=3.5) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  theme_classic() +
+  theme(legend.position="none")
+```
+
+To test how this compares to the transcriptional profiles defined within the GAinS study, let's import a table of genes known to be differentially expressed between SRS groups when measured using Illumina microarrays in  GAinS. This table also contains log fold change estimates.
+```{r load_gains_DEGs, message=FALSE, warning=FALSE}
+DEGs_gains <- read.table("../results/differential_gene_expression/GAinS/GAinS-microarray_DEGs_SRS1-vs-SRS2_limma.tsv", 
+                         sep="\t", header=T)
+rownames(DEGs_gains) <- DEGs_gains$gene_name
+
+head(DEGs_gains)
+```
+By focusing on a set of genes detected in both studies, we can now compare the log fold change estimates directly.
+```{r find_shared_genes, message=FALSE, warning=FALSE}
+shared_genes <- intersect(rownames(DEGs_gains), rownames(DEGs_SRS1_vs_SRS2))
+```
+
+```{r plot_LFC_comparison, message=FALSE, warning=FALSE, echo=FALSE}
+mars_gains_cors <- cor.test(DEGs_gains[shared_genes,]$logFC,DEGs_SRS1_vs_SRS2[shared_genes,]$logFC)
+plot(x = DEGs_gains[shared_genes,]$logFC, 
+     y = DEGs_SRS1_vs_SRS2[shared_genes,]$logFC,
+     xlab = "LFC in GAinS (microarray)",
+     ylab = "LFC in MARS", 
+     xlim = c(-2,3.5),
+     ylim = c(-2,3.5),
+     pch=19,
+     col="darkgrey",
+     main = paste("Cor =", round(mars_gains_cors$estimate,3),
+                  "\np < 2.2e-16"))
+abline(0,1, col="darkred")
+```
+
+I now export these results as a text file for future reference.
+```{r export_DE_genes, eval=FALSE}
+write.table(DEGs_SRS1_vs_SRS2[order(-DEGs_SRS1_vs_SRS2$logFC),], 
+            file = "../results/differential_gene_expression/MARS/DEGs_SRS1-vs-SRS2_limma.tsv",
+            quote = F, row.names = F, sep="\t")
+```
+
+Let's now use pathway enrichment analysis to identify the cellular and biological functions active in SRS1 and SRS2 individuals.
+
+I then use XGR to assess whether differentially expressed genes are enriched in any of the biological pathways reported in REACTOME.
+```{r test_for_pathway_enrichment, eval=FALSE}
+XGR_up <- xEnricherGenes(data=DEGs_SRS1_vs_SRS2$gene_name[DEGs_SRS1_vs_SRS2$DE & DEGs_SRS1_vs_SRS2$logFC > 0], 
+                         background = DEGs_SRS1_vs_SRS2$gene_name,
+                         ontology="	MsigdbC2REACTOME")
+
+XGR_down <- xEnricherGenes(data=DEGs_SRS1_vs_SRS2$gene_name[DEGs_SRS1_vs_SRS2$DE & DEGs_SRS1_vs_SRS2$logFC < 0], 
+                           background = DEGs_SRS1_vs_SRS2$gene_name,
+                           ontology="MsigdbC2REACTOME")
+```
+
+```{r load_XGR_results, warning=FALSE, message=FALSE, echo=FALSE}
+load("../results/differential_gene_expression/MARS/XGR-results-MARS.rdata")
+```
+
+We then subset these results to include only significantly-enriched biological terms.
+```{r format_XGR_results, warning=FALSE, message=FALSE}
+## Reformatting results table
+XGR_up <- xEnrichViewer(XGR_up, top_num=length(XGR_up$adjp), sortBy="fc", details=TRUE)
+XGR_down <- xEnrichViewer(XGR_down, top_num=length(XGR_down$adjp), sortBy="fc", details=TRUE)
+
+## Keeping only significantly enriched pathways
+XGR_up <- XGR_up[XGR_up$adjp <= 0.05,]
+XGR_down <- XGR_down[XGR_down$adjp <= 0.05,]
+```
+
+In order to simplify the full output, we will for now focus exclusively on immune-relevant pathways. We define a bank of common immune terms.
+```{r define_immune_terms, message=FALSE, warning=FALSE}
+immune_terms <- c("NOTCH","TLR","Interleukin","NFk","MHC","(m|M)etabolism","Immun","ZAP-70","PD(-)?1","TCR","BCR","CD28","mTORC","SMAD","IFN","TGF","TRAF","Inflam","IRF","CTLA(-)?4","CD3","Interferon")
+```
+
+When assessing differential pathway enrichment between SRS1 and SRS2, the results look as follows:
+```{r plot_SRS_associated_pathways, message=FALSE, warning=FALSE, echo=FALSE}
+XGR_up$name <- factor(XGR_up$name, levels=rev(XGR_up$name[order(-XGR_up$or)]))
+ggplot(XGR_up[grepl(paste(immune_terms, collapse="|"), XGR_up$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkred") +
+  geom_hline(yintercept = log2(1), color="darkred", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+
+XGR_down$name <- factor(XGR_down$name, levels=rev(XGR_down$name[order(-XGR_down$or)]))
+ggplot(XGR_down[grepl(paste(immune_terms, collapse="|"), XGR_down$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkblue") +
+  geom_hline(yintercept = log2(1), color="darkblue", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+```
+
+The example genes below show a gradual increase in expression along SRSq.
+```{r plot_gex_vs_SRSq_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+gains_top_genes <- c("PGS1","GYG1","C19ORF59","WDR75","FAM38A","BMS1")
+cat(mean(gains_top_genes %in% DEGs_SRS1_vs_SRS2$gene_name[DEGs_SRS1_vs_SRS2$adj.P.Val < 0.05])*100,"% of top SRSq-associated genes in GAinS also pass FDR correction in MARS\n", sep="")
+
+par(mfrow=c(2,3))
+for(i in intersect(gains_top_genes, DEGs_SRS1_vs_SRS2$gene_name[DEGs_SRS1_vs_SRS2$adj.P.Val < 0.05])){
+  print(
+    plot(mars$SRSq,
+     assay(mars[i,]),
+     col = mars$SRS,
+     main=i,
+     xlab="SRSq",
+     ylab="Log-transformed expression",
+     pch=19)
+  )
+}
+```
+
+## Comparing SRS and MARS endotype definitions
+There seems to be some level of agreement between MARS and SRS endotypes, especially for SRS2 and Mars3 (as is indeed recapitulated in the MARS paper). However, there is certainly no 1:1 correspondence.
+```{r compare_mars_to_SRS, message=FALSE, warning=FALSE, echo=FALSE}
+table(mars$SRS, mars$Endotype_class)
+```
+
+This can be easily visualised using an upset plot
+```{r create_MARS_vs_SRS_upset_plot, message=FALSE, warning=FALSE, echo=FALSE}
+upset(
+  fromList(
+    list(
+      "SRS1" = colnames(mars)[mars$SRS=="SRS1"],
+      "SRS2" = colnames(mars)[mars$SRS=="SRS2"],
+      "SRS3" = colnames(mars)[mars$SRS=="SRS3"],
+      "Mars1" = colnames(mars)[mars$Endotype_class=="Mars1"],
+      "Mars2" = colnames(mars)[mars$Endotype_class=="Mars2"],
+      "Mars3" = colnames(mars)[mars$Endotype_class=="Mars3"],
+      "Mars4" = colnames(mars)[mars$Endotype_class=="Mars4"],
+      "HV" = colnames(mars)[mars$Endotype_class=="HV"]
+      )
+    ), 
+  order.by = "freq", 
+  sets = c("SRS1", "SRS2", "SRS3","Mars1","Mars2","Mars3","Mars4","HV"), 
+  keep.order = T
+)
+```
+
+This is even more clear when visualising the Jaccard indexes between all combinations of groups defined using the MARS and GAinS endotypes.
+```{r compare_mars_to_SRS_jaccard_index, message=FALSE, warning=FALSE, echo=FALSE}
+getJaccardIndex <- function(a,b){
+  length(intersect(a,b))/length(union(a,b))
+}
+
+jaccard_indexes <- data.frame(
+  sapply(unique(mars$Endotype_class), FUN=function(i) {
+    sapply(levels(mars$SRS), FUN=function(j){
+      getJaccardIndex(colnames(mars)[mars$Endotype_class==i], colnames(mars)[mars$SRS==j])
+      })
+    }),
+  row.names = levels(mars$SRS)
+  )
+
+pheatmap::pheatmap(jaccard_indexes, cellheight=30, cellwidth=30)
+```
+
+Let's now assess whether the SRS signature is among the main sources of variability in this data set using PCA.
+```{r perform_pca_mars, message=FALSE, warning=FALSE}
+pca_mars <- prcomp(t(assay(mars)))
+```
+
+```{r fetch_pca_coords_mars, message=FALSE, warning=FALSE}
+pc_coords_mars <- data.frame(cbind(pca_mars$x),colData(mars))
+pc_vars <- round(pca_mars$sdev^2/sum(pca_mars$sdev^2)*100,2)
+```
+
+```{r plot_pca_mars, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(pc_coords_mars, aes(x=PC1, y=PC2)) +
+  geom_point(aes(x=PC1, y=PC2, color=Endotype_class), size=3) +
+  xlab(paste("PC1 (",pc_vars[1],"% variance)", sep="")) +
+  ylab(paste("PC2 (",pc_vars[2],"% variance)", sep="")) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom")
+ggMarginal(g1, type = "density", groupFill = T)
+
+g1 <- ggplot(pc_coords_mars, aes(x=PC1, y=PC2)) +
+  geom_point(aes(x=PC1, y=PC2, color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue"), na.value="red") +
+  xlab(paste("PC1 (",pc_vars[1],"% variance)", sep="")) +
+  ylab(paste("PC2 (",pc_vars[2],"% variance)", sep="")) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom")
+ggMarginal(g1, type = "density", groupFill = T)
+
+ggplot(pc_coords_mars, aes(x=PC1, y=PC2)) +
+  geom_point(aes(x=PC1, y=PC2, color=SRSq), size=3) +
+  theme_bw() +
+  xlab(paste("PC1 (",pc_vars[1],"% variance)", sep="")) +
+  ylab(paste("PC2 (",pc_vars[2],"% variance)", sep="")) +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom")
+
+g1 <- ggplot(pc_coords_mars, aes(x=PC1, y=PC2)) +
+  geom_point(aes(x=PC1, y=PC2, color=Endotype_cohort), size=3) +
+  theme_bw() +
+  xlab(paste("PC1 (",pc_vars[1],"% variance)", sep="")) +
+  ylab(paste("PC2 (",pc_vars[2],"% variance)", sep="")) +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom")
+ggMarginal(g1, type = "density", groupFill = T)
+```
+
+## Association of the SRS signature with clinical outcomes
+We first load a table of clinical variables as measured for patients in the MARS cohorts
+```{r load_clinical_data, message=FALSE, warning=FALSE}
+mars_clindat <- read.csv("../data/mars_gex/clinical_data/MARS_clinical-data.csv", header=T)
+```
+
+We fetch the clinical measurements for all patients present in this data set.
+```{r fetch_clinvars, message=FALSE, warning=FALSE}
+# Define variables of interest
+SOFA <- c()
+SOFA_circ <- c()
+SOFA_coag <- c()
+SOFA_liver <- c()
+SOFA_renal <- c()
+SOFA_resp <- c()
+AKI_score <- c()
+Immune_deficiency <- c()
+Metastatic_malignancy <- c()
+Solid_malignancy <- c()
+Hematologic_malignancy <- c()
+HIV_seropositive <- c()
+AIDS <- c()
+Chronic_corticosteroids <- c()
+
+# Fetch values for these variables
+for(i in mars$chipID){
+  
+  dat <- mars_clindat[mars_clindat$chipID == i,]
+  
+  if(nrow(dat)==0){
+    sofa <- NA
+    sofa_circ <- NA
+    sofa_coag <- NA
+    sofa_liver <- NA
+    sofa_renal <- NA
+    sofa_resp <- NA
+    aki_score <- NA
+    immune_deficiency <- NA
+    metastatic_malignancy  <- NA
+    solid_tumor  <- NA
+    hematologic_malignancy  <- NA
+    hiv_seropositive  <- NA
+    aids  <- NA
+    chronic_corticosteroid  <- NA
+  } else{
+    sofa  <- dat$SOFAtot
+    sofa_circ <- dat$SOFA_Circulation
+    sofa_coag <- dat$SOFA_Coagulation
+    sofa_liver <- dat$SOFA_Liver
+    sofa_renal <- dat$SOFA_Renal
+    sofa_resp <- dat$SOFA_Respiration
+    aki_score  <- dat$Acute_kidney_injury_score
+    immune_deficiency  <- dat$Immune_deficiency
+    metastatic_malignancy  <- dat$Metastatic_malignancy
+    solid_tumor  <- dat$Non_metastatic_solid_tumor
+    hematologic_malignancy  <- dat$Hematologic_malignancy
+    hiv_seropositive  <- dat$HIV_seropositivity
+    aids  <- dat$AIDS
+    chronic_corticosteroid  <- dat$Chronic_corticosteroids
+  }
+  
+   SOFA <- c(SOFA, sofa)
+   SOFA_circ <- c(SOFA_circ, sofa_circ)
+   SOFA_coag <- c(SOFA_coag, sofa_coag)
+   SOFA_liver <- c(SOFA_liver, sofa_liver)
+   SOFA_renal <- c(SOFA_renal, sofa_renal)
+   SOFA_resp <- c(SOFA_resp, sofa_resp)
+   AKI_score <- c(AKI_score, aki_score)
+   Immune_deficiency <- c(Immune_deficiency, immune_deficiency)
+   Metastatic_malignancy <- c(Metastatic_malignancy, metastatic_malignancy)
+   Solid_malignancy <- c(Solid_malignancy, solid_tumor)
+   Hematologic_malignancy <- c(Hematologic_malignancy, hematologic_malignancy)
+   HIV_seropositive <- c(HIV_seropositive, hiv_seropositive)
+   AIDS <- c(AIDS, aids)
+   Chronic_corticosteroids <- c(Chronic_corticosteroids, chronic_corticosteroid)
+  
+}
+```
+
+Finally, we add these measurements to the metadata table
+```{r add_clinvars_to_metadata, message=FALSE, warning=FALSE}
+mars$SOFA <- SOFA
+mars$SOFA_circ <- SOFA_circ
+mars$SOFA_coag <- SOFA_coag
+mars$SOFA_liver <- SOFA_liver
+mars$SOFA_renal <- SOFA_renal
+mars$SOFA_resp <- SOFA_resp
+mars$AKI_score <- AKI_score
+mars$Immune_deficiency <- Immune_deficiency
+mars$Metastatic_malignancy <- Metastatic_malignancy
+mars$Solid_malignancy <- Solid_malignancy
+mars$Hematologic_malignancy <- Hematologic_malignancy
+mars$HIV_seropositive <- HIV_seropositive
+mars$AIDS <- AIDS
+mars$Chronic_corticosteroids <- Chronic_corticosteroids
+
+rm(SOFA, SOFA_circ, SOFA_coag, SOFA_liver, SOFA_renal, SOFA_resp, AKI_score, 
+   Immune_deficiency, 
+   Metastatic_malignancy, Solid_malignancy, Hematologic_malignancy, 
+   HIV_seropositive, AIDS, 
+   Chronic_corticosteroids)
+```
+
+Let's now test the association of SRS/SRSq with each of these clinical variables.
+
+### Septic shock
+There is an association between SRS group and the proportion of sepsis shock.
+```{r plot_sepsis_shock_proportions, message=FALSE, warning=FALSE, echo=FALSE}
+mars_shock <- data.frame()
+for(i in c("SRS1","SRS2")) {
+  dat <- mars$septic_shock[mars$SRS == i]
+  mars_shock <- rbind(mars_shock,
+                      data.frame(
+                        SRS=i,
+                        Yes=mean(dat==1, na.rm=T),
+                        No=mean(dat==0, na.rm=T))
+                      )
+  }
+mars_shock <- melt(mars_shock)
+colnames(mars_shock) <- c("SRS","Septic_shock","Proportion")
+
+mars_shock$SRS <- factor(mars_shock$SRS, levels=c("SRS1","SRS2"))
+
+ggplot(mars_shock, aes(x=SRS)) +
+  geom_bar(aes(weight=Proportion, fill=Septic_shock), width=0.5) +
+  scale_fill_manual(values=c("darkblue","lightblue")) +
+  xlab("Endotype") +
+  ylab("Proportion with septic shock") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Let's now test if this association is significant using a Fisher's exact test
+```{r run_fishers_test_shock_vs_SRS, message=FALSE, warning=FALSE}
+shock_freq_per_SRS <- table(mars$septic_shock, mars$SRS)
+dimnames(shock_freq_per_SRS) <- list(Septic_shock = c("No","Yes"),
+                                     Endotype = c("SRS1","SRS2","SRS3"))
+
+shock_freq_per_SRS[,1:2]
+fisher.test(shock_freq_per_SRS[,1:2])
+```
+
+```{r plot_AKI_proportions, message=FALSE, warning=FALSE, echo=FALSE}
+mars_AKI <- data.frame()
+for(i in c("SRS1","SRS2")) {
+  dat <- mars$AKI_score[mars$SRS == i]
+  mars_AKI <- rbind(mars_AKI,
+                      data.frame(
+                        SRS=i,
+                        Stage_0=mean(dat==0, na.rm=T),
+                        Stage_1=mean(dat==1, na.rm=T),
+                        Stage_2=mean(dat==2, na.rm=T),
+                        Stage_3=mean(dat==3, na.rm=T))
+                      )
+  }
+mars_AKI <- melt(mars_AKI)
+colnames(mars_AKI) <- c("SRS","AKI_score","Proportion")
+
+mars_AKI$SRS <- factor(mars_AKI$SRS, levels=c("SRS1","SRS2"))
+
+ggplot(mars_AKI, aes(x=SRS)) +
+  geom_bar(aes(weight=Proportion, fill=AKI_score), width=0.5) +
+  scale_fill_manual(values=rev(c("#d7191c","#fdae61","#abdda4","#2b83ba"))) +
+  xlab("Endotype") +
+  ylab("Proportion with septic shock") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Let's now test if this association is significant using a Fisher's exact test
+```{r run_fishers_test_shock_vs_SRS, message=FALSE, warning=FALSE}
+AKI_freq_per_SRS <- table(mars$AKI_score, mars$SRS)
+dimnames(AKI_freq_per_SRS) <- list(AKI_score = c("0","1","2","3"),
+                                   Endotype = c("SRS1","SRS2","SRS3"))
+
+AKI_freq_per_SRS[,1:2]
+fisher.test(AKI_freq_per_SRS[,1:2])
+```
+
+### SOFA scores
+The association between SRS groups and SOFA scores is as follows.
+```{r plot_SOFA_vs_SRS, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(data.frame(colData(mars)), aes(x=SRS, y=SOFA)) +
+  geom_boxplot() +
+  geom_jitter(aes(color=SRS), width=0.1, size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_compare_means(method="wilcox.test",comparisons = list(c("SRS1","SRS2"), c("SRS1","SRS3"), c("SRS2", "SRS3"))) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+ggplot(data.frame(colData(mars)), aes(x=SRSq, y=SOFA)) +
+  geom_smooth(method="lm") +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+
+
+ggplot(data.frame(colData(mars[,!is.na(mars$Chronic_corticosteroids)])), aes(x=SRS, y=SOFA)) +
+  geom_boxplot() +
+  geom_jitter(aes(color=SRS), width=0.1, size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  facet_grid(~Chronic_corticosteroids) +
+  stat_compare_means() +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+
+ggplot(data.frame(colData(mars[,!is.na(mars$Chronic_corticosteroids)])), aes(x=SRSq, y=SOFA)) +
+  geom_smooth(method="lm") +
+  geom_point(aes(color=SRS), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  facet_grid(~Chronic_corticosteroids) +
+  stat_cor() +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+Let's now analyse organ-specific SOFA scores
+```{r plot_organ_specific_SOFA_vs_SRS, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(data.frame(colData(mars[,mars$SRS != "SRS3"])), aes(x=SRS, y=SOFA_circ)) +
+  geom_jitter(aes(color=SRS), width=0.1, height=0.25, size=2, alpha=0.5) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_summary(fun.y= median, fun.ymin=median, fun.ymax=median, geom="crossbar", width=0.5, color="darkred") +
+  theme_classic() +
+  theme(legend.position = "none")
+g2 <- ggplot(data.frame(colData(mars[,mars$SRS != "SRS3"])), aes(x=SRS, y=SOFA_coag)) +
+  geom_jitter(aes(color=SRS), width=0.1, height=0.25, size=2, alpha=0.5) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+   stat_summary(fun.y= median, fun.ymin=median, fun.ymax=median, geom="crossbar", width=0.5, color="darkred") +
+  theme_classic() +
+  theme(legend.position = "none")
+g3 <- ggplot(data.frame(colData(mars[,mars$SRS != "SRS3"])), aes(x=SRS, y=SOFA_resp)) +
+  geom_jitter(aes(color=SRS), width=0.1, height=0.25, size=2, alpha=0.5) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_summary(fun.y= median, fun.ymin=median, fun.ymax=median, geom="crossbar", width=0.5, color="darkred") +
+  theme_classic() +
+  theme(legend.position = "none")
+g4 <- ggplot(data.frame(colData(mars[,mars$SRS != "SRS3"])), aes(x=SRS, y=SOFA_liver)) +
+  geom_jitter(aes(color=SRS), width=0.1, height=0.25, size=2, alpha=0.5) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_summary(fun.y= median, fun.ymin=median, fun.ymax=median, geom="crossbar", width=0.5, color="darkred") +
+  theme_classic() +
+  theme(legend.position = "none")
+g5 <- ggplot(data.frame(colData(mars[,mars$SRS != "SRS3"])), aes(x=SRS, y=SOFA_renal)) +
+  geom_jitter(aes(color=SRS), width=0.1, height=0.25, size=2, alpha=0.5) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_summary(fun.y= median, fun.ymin=median, fun.ymax=median, geom="crossbar", width=0.5, color="darkred") +
+  theme_classic() +
+  theme(legend.position = "none")
+plot_grid(g1,g2,g3,g4,g5,ncol=3,nrow=2)
+```
+
+We then perform a series of Mood's median tests to assess if the difference in median organ-specific SOFA scores between SRS groups is significant.
+```{r perform_moods_test, message=FALSE, warning=FALSE}
+mood.medtest(SOFA_circ ~ SRS, data  = data.frame(colData(mars[,mars$SRS != "SRS3"])))
+mood.medtest(SOFA_coag ~ SRS, data  = data.frame(colData(mars[,mars$SRS != "SRS3"])))
+mood.medtest(SOFA_resp ~ SRS, data  = data.frame(colData(mars[,mars$SRS != "SRS3"])))
+mood.medtest(SOFA_liver ~ SRS, data  = data.frame(colData(mars[,mars$SRS != "SRS3"])))
+mood.medtest(SOFA_renal ~ SRS, data  = data.frame(colData(mars[,mars$SRS != "SRS3"])))
+```
+
+
+### Mortality
+SOFA is significantly associated with 28-day mortality
+```{r plot_SOFA_vs_mortality, message=FALSE, warning=FALSE}
+ggplot(data.frame(colData(mars)[!is.na(mars$Mortality_event_28days),]), aes(x=as.factor(Mortality_event_28days), y=SOFA)) +
+  geom_boxplot() +
+  geom_jitter(color="grey", width=0.1, size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_compare_means(method="wilcox.test") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+Septic shock is also significantly associated with 28-day mortality
+```{r plot_shock_vs_mortality, message=FALSE, warning=FALSE, echo=FALSE}
+mars_shock <- data.frame()
+for(i in c(0,1)) {
+  dat <- mars$Mortality_event_28days[mars$septic_shock == i]
+  mars_shock <- rbind(mars_shock,
+                      data.frame(
+                        septic_shock=i,
+                        Yes=mean(dat==0, na.rm=T),
+                        No=mean(dat==1, na.rm=T))
+                      )
+}
+mars_shock$septic_shock <- c("No", "Yes")
+mars_shock <- melt(mars_shock)
+colnames(mars_shock) <- c("Septic_shock","Survivor","Proportion")
+
+ggplot(mars_shock, aes(x=Septic_shock)) +
+  geom_bar(aes(weight=Proportion, fill=Survivor), width=0.5) +
+  scale_fill_manual(values=c("darkblue","lightblue")) +
+  xlab("Septic shock") +
+  ylab("Proportion") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+survival_freq_per_shock <- table(mars$septic_shock, mars$Mortality_event_28days)
+dimnames(survival_freq_per_shock) <- list(Septic_shock = c("No","Yes"),
+                                          Survival = c("Yes","No"))
+fisher.test(survival_freq_per_shock)
+```
+
+
+Let's test this using proportional hazard models and assess whether there is an association between other factors such as SRS group and survival.
+
+We begin by extracting the endotype and outcome information from the metadata table.
+```{r extract_outcome_information, message=FALSE, warning=FALSE}
+mars_survdat <- data.frame(colData(mars))
+
+mars_survdat$age_bin <- ceiling(mars_survdat$Age/10)
+mars_survdat$Endotype_class <- factor(mars_survdat$Endotype_class, levels=c("Mars4","Mars3","Mars2","Mars1"))
+mars_survdat$SRS <- factor(mars_survdat$SRS, levels=c("SRS3","SRS2","SRS1"))
+
+mars_survdat <- mars_survdat[!is.na(mars_survdat$SRS),]
+```
+
+We fit Cox models for a variety of clinical variables which might have an impact on mortality.
+```{r fit_cox_models_microarray, message=FALSE, warning=FALSE}
+mars_survdat$SRSq_adj <- 10*mars_survdat$SRSq
+
+MARS_cox <- summary(coxph(
+  Surv(Time_to_event_28days, Mortality_event_28days) ~ Endotype_class,
+  subset = !is.na(Endotype_class),
+  data = mars_survdat
+  ))
+SRSq_cox <- summary(coxph(
+  Surv(Time_to_event_28days, Mortality_event_28days) ~ SRSq_adj, 
+  subset = !is.na(SRSq_adj), 
+  data = mars_survdat
+  ))
+SOFA_cox <- summary(coxph(
+  Surv(Time_to_event_28days, Mortality_event_28days) ~ SOFA, 
+  subset = !is.na(SOFA), 
+  data = mars_survdat
+  ))
+SOFA_circ_cox <- summary(coxph(
+  Surv(Time_to_event_28days, Mortality_event_28days) ~ SOFA_circ, 
+  subset = !is.na(SOFA), 
+  data = mars_survdat
+  ))
+Shock_cox <- summary(coxph(
+  Surv(Time_to_event_28days, Mortality_event_28days) ~ septic_shock, 
+  subset = !is.na(septic_shock), 
+  data = mars_survdat
+  ))
+
+cox_univariate_microarray <- data.frame(
+  variable = c("Mars endotype (Mars1)","SRSq (per 0.1-unit)","SOFA score (per unit)", "SOFA circulation score (per unit)","Septic Shock"),
+  HR = c(MARS_cox$conf.int[3,1],
+         SRSq_cox$conf.int[1],
+         SOFA_cox$conf.int[1],
+         SOFA_circ_cox$conf.int[1],
+         Shock_cox$conf.int[1]),
+  HR_lower = c(MARS_cox$conf.int[3,3],
+               SRSq_cox$conf.int[3],
+               SOFA_cox$conf.int[3],
+               SOFA_circ_cox$conf.int[3],
+               Shock_cox$conf.int[3]),
+  HR_upper = c(MARS_cox$conf.int[3,4],
+               SRSq_cox$conf.int[4],
+               SOFA_cox$conf.int[4],
+               SOFA_circ_cox$conf.int[4],
+               Shock_cox$conf.int[4]),
+  pval = c(MARS_cox$logtest["pvalue"],
+           SRSq_cox$logtest["pvalue"],
+           SOFA_cox$logtest["pvalue"],
+           SOFA_circ_cox$logtest["pvalue"],
+           Shock_cox$logtest["pvalue"])
+)
+
+cox_univariate_microarray
+```
+
+
+We can now assess correlation between SRS group and survival. 
+```{r plot_survival_curve_by_SRS_mars, message=FALSE, warning=FALSE}
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ SRS,
+                data=mars_survdat), 
+  xlab = "Days since ICU admission", 
+  ylab = "Survival probability",
+  xlim = c(0,29),
+  title = "28-day survival (MARS)",
+  conf.int = T, 
+  pval = T,
+  palette = c(
+    "darkblue",
+    "steelblue",
+    "darkred"), 
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ SRS,
+                data=mars_survdat[mars_survdat$Endotype_cohort %in% c("discovery"),]), 
+  xlab = "Days since ICU admission", 
+  ylab = "Survival probability",
+  title = "28-day survival (MARS discovery cohort)",
+  conf.int = T,
+  pval = T,
+  palette = c(
+    "darkblue",
+    "steelblue",
+    "darkred"), 
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ SRS,
+                data=mars_survdat[mars_survdat$Endotype_cohort %in% c("validation"),]), 
+  xlab = "Days since ICU admission", 
+  ylab = "Survival probability",
+  title = "28-day survival (MARS validation cohort)",
+  conf.int = T,
+  pval = T,
+  palette = c(
+    "darkblue",
+    "steelblue",
+    "darkred"), 
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+```
+
+Let's also assess 18-day survival when stratified by both SRS and either septic shock diagnosis or Mars endotype.
+```{r plot_survival_curve_by_SRS_and_Mars_or_shock, message=FALSE, warning=FALSE}
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ SRS + septic_shock,
+                data=mars_survdat), 
+  xlab = "Days since ICU admission", 
+  ylab = "Survival probability",
+  xlim = c(0,29),
+  title = "28-day survival (MARS)",
+  conf.int = T, 
+  pval = T, 
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ SRS + Endotype_class,
+                data=mars_survdat), 
+  xlab = "Days since ICU admission", 
+  ylab = "Survival probability",
+  xlim = c(0,29),
+  title = "28-day survival (MARS)",
+  conf.int = F, 
+  pval = T, 
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+  )
+```
+
+Thus, the association between SRS and mortality is not replicated from the MARS cohort. 
+
+Finally, let's test for a potential interaction effect of SRS and corticosteroid treatment on mortality.
+```{r}
+glucocorticoid_responsive_genes <- c("FKBP5", "TSC22D3",
+                                     "ZFP36","DUSP1")
+
+pheatmap::pheatmap(t(assay(mars[glucocorticoid_responsive_genes,])), scale = "none")
+
+corticosteroid_gex <- data.frame(apply(assay(mars[glucocorticoid_responsive_genes,]), MARGIN = 1, scale))
+steroid_score <- rowMeans(corticosteroid_gex)
+
+hist(steroid_score)
+qqnorm(steroid_score)
+
+mars$Steroid_score <- steroid_score
+mars_survdat$Steroid_score <- steroid_score
+
+plot(mars$Steroid_score,
+     mars$SRSq)
+
+pc_coords_mars$Steroid_score <- steroid_score
+ggplot(pc_coords_mars, aes(x=PC1, y=PC2)) +
+  geom_point(aes(x=PC1, y=PC2, color=Steroid_score), size=3) +
+  xlab(paste("PC1 (",pc_vars[1],"% variance)", sep="")) +
+  ylab(paste("PC2 (",pc_vars[2],"% variance)", sep="")) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom")
+
+mars_survdat$Cortisol <- "Medium"
+mars_survdat$Cortisol[mars_survdat$Steroid_score > 0.5] <- "High"
+mars_survdat$Cortisol[mars_survdat$Steroid_score < -0.5] <- "Low"
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ Cortisol,
+                data=mars_survdat), 
+  xlab = "Days since ICU admission", 
+  ylab = "Survival probability",
+  xlim = c(0,29),
+  title = "28-day survival (MARS)",
+  conf.int = F, 
+  pval = T, 
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ SRS + Cortisol,
+                data=mars_survdat), 
+  xlab = "Days since ICU admission", 
+  ylab = "Survival probability",
+  xlim = c(0,29),
+  title = "28-day survival (MARS)",
+  conf.int = F, 
+  pval = T, 
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ SRS + Cortisol,
+                data=mars_survdat[mars_survdat$septic_shock==0,]), 
+  xlab = "Days since ICU admission", 
+  ylab = "Survival probability",
+  xlim = c(0,29),
+  title = "28-day survival (MARS)",
+  conf.int = F, 
+  pval = T, 
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ SRS + Cortisol,
+                data=mars_survdat[mars_survdat$septic_shock==1,]), 
+  xlab = "Days since ICU admission", 
+  ylab = "Survival probability",
+  xlim = c(0,29),
+  title = "28-day survival (MARS)",
+  conf.int = T, 
+  pval = T, 
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+```
+
+Finally, we assess whether combining Mars and SRS endotypes provides additional power to predict mortality
+```{r}
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ Endotype_class,
+                data=mars_survdat), 
+  xlab = "Days since ICU admission", 
+  ylab = "28-day survival probability",
+  xlim = c(0,29),
+  title = "",
+  conf.int = T, 
+  pval = T, 
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ Endotype_class + SRS,
+                data=mars_survdat), 
+  xlab = "Days since ICU admission", 
+  ylab = "28-day survival probability",
+  xlim = c(0,29),
+  title = "",
+  conf.int = T, 
+  pval = T, 
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+
+ggsurvplot(
+  fit = survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ Endotype_class + SRS,
+                data=mars_survdat), 
+  xlab = "Days since ICU admission", 
+  ylab = "28-day survival probability",
+  xlim = c(0,29),
+  title = "",
+  conf.int = T, 
+  pval = T, 
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+```
+
+
+Let's now perform a sliding window analysis of survival to assess if the quantitative score SRSq gives us any additional information. For this analysis, we focus only on the validation cohort, since there is no SRS-mortality association in the discovery cohort.
+```{r perform_sliding_window_analysis, message=FALSE, warning=FALSE}
+vars_of_interest <- c("Time_to_event_28days", "Mortality_event_28days" ,"SRSq")
+mars_roll <- mars_survdat[,vars_of_interest]
+mars_roll <- mars_roll[order(mars_roll$SRSq),]
+
+window_width <- round(nrow(mars_roll)*0.35)
+
+rolling_survival_mars <- rollapply(mars_roll, width=window_width, FUN = function(dat){
+  
+  dat <- data.frame(dat)
+  
+  mean_SRSq <- median(dat[,"SRSq"])
+  
+  surv_res <- summary(survfit(Surv(Time_to_event_28days, Mortality_event_28days) ~ 1,
+                             data=dat), times=28)
+  mean_surv <- surv_res$surv
+  surv_upper <- surv_res$upper
+  surv_lower <- surv_res$lower
+  
+  res <- cbind(mean_SRSq, surv_lower, mean_surv, surv_upper)
+  return(res)
+  
+  },
+  
+  by.column = F)
+
+rolling_survival_mars <- data.frame(rolling_survival_mars)
+```
+
+
+There is no association between SRSq and survival:
+```{r plot_survival_by_sliding_window}
+ggplot(rolling_survival_mars, aes(x=mean_SRSq, y=1-mean_surv)) +
+  geom_errorbar(aes(ymin=1-surv_lower, ymax=1-surv_upper), colour="lightgrey") +
+  geom_point() +
+  ylim(0,0.6) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5))
+```
+
+
+# Mediation analysis
+## Testing for indirect effects via septic shock
+We now apply mediation analysis to assess whether the SRS signature is associated with mortality indirectly via septic shock, despite a direct association being absent.
+
+For this analysis we treat mortality as an outcome and shock as a mediator. We model the presence of septic shock as a function of SRSq using a logistic regression, followed by modeling the presence of a mortality event as function of septic shock using a second logistic regression. Both regressions are adjusted for covariates like age and cohort of origin.
+```{r model_mediators_shock, message=FALSE, warning=FALSE}
+mediator_fit <- glm(septic_shock ~ SRSq_adj + age_bin + Endotype_cohort, family = binomial("probit"), data = mars_survdat)
+outcome_fit <- glm(Mortality_event_28days ~ septic_shock + SRSq_adj + age_bin + Endotype_cohort, family = binomial("probit"), data = mars_survdat)
+```
+
+We then use the mediate function in the mediator package to test for a significant mediation effect using Monte Carlo simulations.
+```{r perform_mediation_analysis_shock, message=FALSE, warning=FALSE}
+mediation_res <- mediate(model.m = mediator_fit, model.y = outcome_fit,
+                         sims = 1000,
+                         treat = "SRSq_adj", mediator = "septic_shock",
+                         control.value = median(mars_survdat$SRSq_adj[mars_survdat$SRS %in% "SRS2"]),
+                         treat.value = median(mars_survdat$SRSq_adj[mars_survdat$SRS %in% "SRS1"]))
+
+summary(mediation_res)
+```
+
+There is a significant indirect effect of SRSq on death via septic shock, which looks as follows:
+```{r plot_mediation_results_shock, message=FALSE, warning=FALSE, echo=FALSE}
+plot(mediation_res)
+```
+
+## Testing for indirect effects via SOFA scores
+Let's repeat this analysis using SOFA scores. We will now model SOFA scores as a linear function of SRSq, followed by modeling the presence of a mortality event as function of SOFA scores using a logistic regression.
+```{r model_mediators_SOFA, message=FALSE, warning=FALSE}
+mediator_fit <- lm(SOFA ~ SRSq_adj + age_bin + Endotype_cohort, data = mars_survdat)
+outcome_fit <- glm(Mortality_event_28days ~ SOFA + SRSq_adj + age_bin + Endotype_cohort, family = binomial("probit"), data = mars_survdat)
+```
+
+We then use the mediate function in the mediator package to test for a significant mediation effect using Monte Carlo simulations.
+```{r perform_mediation_analysis_SOFA, message=FALSE, warning=FALSE}
+mediation_res <- mediate(model.m = mediator_fit, model.y = outcome_fit,
+                         sims = 1000,
+                         treat = "SRSq_adj", mediator = "SOFA",
+                         control.value = median(mars_survdat$SRSq_adj[mars_survdat$SRS %in% "SRS2"]),
+                         treat.value = median(mars_survdat$SRSq_adj[mars_survdat$SRS %in% "SRS1"]))
+
+summary(mediation_res)
+```
+
+There is also a significant indirect effect of SRSq on death via SOFA scores, which looks as follows:
+```{r plot_mediation_results_SOFA, message=FALSE, warning=FALSE, echo=FALSE}
+plot(mediation_res)
+```
+
+```{r run_sensitivity_analysis_for_SOFA_mediation, eval=FALSE, echo=FALSE}
+sensitivity_results_sofa <- medsens(mediation_res, rho.by = 0.1, effect.type = "indirect", sims = 1000)
+plot(sensitivity_results_sofa)
+```
+
+# R session
+```{r session_info, message=FALSE, warning=FALSE}
+sessionInfo()
+```
+

@@ -1,0 +1,951 @@
+---
+title: "Exploratory analysis of GAinS microarray data"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This markdown document contains a general exploratory analysis of the full microarray data for the GAinS consortium. This data was previously processed by Katie Burnham, who performed quality filtering, normalization, and batch regression between different microarray experiments.
+
+## Loading libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(SummarizedExperiment)
+library(umap)
+library(ggrepel)
+library(pheatmap)
+library(corrplot)
+library(ROCR)
+library(illuminaHumanv4.db)
+```
+
+## Loading microarray data
+Reading the following files:
+
+1. Normalised and batch-corrected expression matrix
+```{r load_expression_matrix, message=FALSE, warning=FALSE}
+gains_expression <- read.table("/well/jknight/Sepsis/Gene_Expression/All_GEX_MM_dedup_norm_combat.txt",
+                               sep = "\t",
+                               header = T, 
+                               row.names = 1)
+```
+
+2. Sample information and metadata, along with SRS assignments per sample obtained from supervised classification with Emma's model
+```{r load_sample_info, message=FALSE, warning=FALSE}
+gains_sample_info <- read.table("/well/jknight/Sepsis/Gene_Expression/SRS_info_676.txt",
+                                sep ="\t",
+                                header = T)
+```
+
+
+4. Probe information for the Illumina HumanHT v4 microarray
+```{r load_probe_info, message=FALSE, warning=FALSE}
+probe_mappings <- read_tsv("/well/jknight/Sepsis/Gene_Expression/Microarray_combined_816/HumanHT-12_V4_0_R2_15002873_B.txt")
+```
+
+## Formatting data
+### Matching expression table to probe information
+Filtering probe information to only keep those probes present in the study
+```{r filter_probes, message=FALSE, warning=FALSE}
+probe_mappings <- filter(probe_mappings, Array_Address_Id %in% rownames(gains_expression))
+probe_mappings <- data.frame(probe_mappings)
+```
+
+Addinge Ensembl IDs corresponding to each of the Illumina HT probes
+```{r add_ensembl_ids, message=FALSE, warning=FALSE}
+# Retrieving Ensembl IDs for all Illumina probes present in the database
+probe2ensembl <- as.list(
+  illuminaHumanv4ENSEMBL[intersect(probe_mappings$Probe_Id, mappedkeys(illuminaHumanv4ENSEMBL))]
+  )
+
+# Adding Ensembl IDs to these probes
+ensembl_ids <- c()
+for(i in probe_mappings$Probe_Id){
+  if(i %in% names(probe2ensembl)){
+    gene_id <- probe2ensembl[[i]][[1]]
+  } else{
+    gene_id <- NA
+  }
+  ensembl_ids <- c(ensembl_ids, gene_id)
+}
+probe_mappings$Ensembl_ID <- ensembl_ids
+head(probe_mappings[,c("Array_Address_Id","Probe_Id","ILMN_Gene","Ensembl_ID")])
+```
+
+Averaging measurements from probes which tag the same gene
+```{r average_expression_per_gene, message=FALSE, warning=FALSE}
+# Listing genes in study
+genes_in_study <- unique(probe_mappings$ILMN_Gene)
+
+# Averaging probe measurements per gene
+expression_per_gene <- sapply(genes_in_study, FUN = function(gene){
+  probe_ids <- as.character(probe_mappings$Array_Address_Id[probe_mappings$ILMN_Gene==gene])
+  mean_expression <- colMeans(gains_expression[probe_ids,])
+  return(mean_expression)
+})
+expression_per_gene <- data.frame(t(expression_per_gene))
+```
+
+Making sure matrix row names match gene names in the probe information table
+```{r match_gene_names, message=FALSE, warning=FALSE}
+gene_annotations <- probe_mappings[!duplicated(probe_mappings$ILMN_Gene),
+                                   c("ILMN_Gene","Ensembl_ID","Chromosome","Source","RefSeq_ID","Symbol","Protein_Product")]
+rownames(gene_annotations) <- gene_annotations$ILMN_Gene
+
+mean(rownames(expression_per_gene) == rownames(gene_annotations))
+```
+
+### Matching expression table to sample information
+Making sure matrix column names match sample IDs in the sample information table
+```{r match_sample_ids, message=FALSE, warning=FALSE}
+rownames(gains_sample_info) <- gains_sample_info$SampleID
+
+mean(colnames(expression_per_gene) == rownames(gains_sample_info))
+```
+
+### Creating summarised experiment
+Defining a summarized experiment object which contains both expression measurements and metadata (for samples and genes)
+```{r create_summarized_experiment}
+gains_microarray <- SummarizedExperiment(assays = expression_per_gene,
+                                         colData = gains_sample_info, 
+                                         rowData = gene_annotations)
+```
+
+```{r clean_RAM, message=FALSE, warning=FALSE, echo=FALSE}
+## Removing unnecessary variables from the environment
+rm(gains_expression, expression_per_gene, gains_sample_info, gene_annotations, probe_mappings, probe2ensembl)
+```
+
+## Saving summarised experiment
+Exporting summarised experiment object as an R data set
+```{r save_rds, message=FALSE, warning=FALSE, eval=FALSE}
+saveRDS(gains_microarray, file="/well/jknight/eddie/consensus_endotyping/data/gains_full_microarray_dedup_norm_combat_average-per-gene.rds")
+```
+
+## Exploring data
+### Checking for heteroskedasticity
+Verifying whether there is any heteroskedasticity left after the previous normalization and batch correction steps
+```{r estimate_gene_variances, message=FALSE, warning=FALSE}
+# Estimating gene variances
+gene_variances <- data.frame(mean_expression = rowMeans(assay(gains_microarray)),
+                             variance = rowVars(as.matrix(assay(gains_microarray))))
+
+# Identifying most variable genes
+gene_variances <- gene_variances[order(-gene_variances$variance),]
+gene_variances$rank <- 1:nrow(gene_variances)
+gene_variances$top_variable <- FALSE
+gene_variances$top_variable[1:1000] <- TRUE
+gene_variances <- gene_variances[rownames(gains_microarray),]
+```
+
+A simple visual inspection reveals no relationship between expression level and expression variance
+```{r plot_mean_vs_variance, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(gene_variances, aes(x=mean_expression, y=variance)) + 
+  geom_point(aes(color=top_variable), size=0.75) +
+  scale_color_manual(values=c("#8da0cb","#fc8d62")) +
+  xlab("Mean expression") +
+  ylab("Variance in expression") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+### Principal component analysis (PCA)
+Performing PCA based on the all genes
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca <- prcomp(t(assay(gains_microarray)))   
+
+pc_coords <- data.frame(cbind(pca$x,colData(gains_microarray)))
+pc_variance <- pca$sdev^2/sum(pca$sdev^2)
+```
+
+There seems to be no separation by batch (i.e. batch effects were completely removed by previous correction steps)
+```{r plot_pca_by_batch, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=Batch), size=3) +
+  scale_color_manual(values = c("#a6cee3","#1f78b4","#b2df8a","#33a02c")) +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+There is a clear separation by time of sampling (days 1, 3, or 5), especially for day 1 vs the rest.
+```{r plot_pca_by_dat, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(Day)), size=3) +
+  scale_color_manual(values = c("#a1dab4","#41b6c4","#225ea8")) +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+The main axis of variation, however, is indeed driven by sepsis response signatures (SRS). 
+```{r plot_pca_by_srs, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(SRS)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), na.value="lightgrey", name="Endotype", labels=c("SRS1","SRS2")) +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Since PC1 separates SRS endotypes so well, it is worth exploring which genes contribute the most to this component. This plot shows the PC1 loading for each gene in the study. The genes highlighted contribute the most in each direction.
+```{r get_PC_loadings, message=FALSE, warning=FALSE}
+# Extracting loadings for the first 10 PCs
+pc_loadings <- data.frame(gene = rownames(pca$rotation),
+                           pca$rotation[,1:10])
+```
+
+```{r plot_pc1_loadings, message=FALSE, warning=FALSE, echo=FALSE}
+pc1_loadings <- pc_loadings[order(pc_loadings$PC1),]
+pc1_loadings$gene_rank <- 1:nrow(pc1_loadings)
+
+ggplot(pc1_loadings, aes(x=gene_rank, y=PC1)) + 
+  geom_point() +
+  geom_label_repel(data=pc1_loadings[1:20,], aes(x=gene_rank, y=PC1, label=gene), size=3) +
+  geom_label_repel(data=pc1_loadings[(nrow(pc1_loadings)-20):nrow(pc1_loadings),], 
+                   aes(x=gene_rank, y=PC1, label=gene), size=3) +
+  ylim(-0.25,0.1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Moreover, the plot below indicates the PC1 loadings for all 7 genes in the SRS signature which were detected in this dataset.
+```{r define_srs_genes, message=FALSE, warning=FALSE}
+# Note that two genes have different names here compared to the paper (ARL14EP = C110rf46, and ADGRE3 = EMR3)
+SRS_genes <- c("C11ORF46","CCNB1IP1","DYRK2","EMR3","MDC1","TDRD9","ZAP70")
+```
+
+```{r plot_pc1_loadings_of_classifier_genes, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank, y=PC1)) + 
+  geom_point() +
+  geom_point(data=pc1_loadings[intersect(rownames(pc1_loadings),SRS_genes),],
+             aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkred") +
+  geom_label_repel(data=pc1_loadings[intersect(rownames(pc1_loadings),SRS_genes),],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkred") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Shown below are also the PC1 loadings of eight genes higlighted as differentially expressed between SRS1 and SRS2 in the original GAinS paper.
+```{r plot_pc1_loadings_of_DE_genes, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank, y=PC1)) + 
+  geom_point() +
+  geom_point(data=pc1_loadings[intersect(rownames(pc1_loadings),c("ANKS1A")),],
+             aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkred") +
+  geom_point(data=pc1_loadings[intersect(rownames(pc1_loadings),
+                                         c("SLC25A38","RSAD1","LY9","ZNHIT6","TSEN554","ABHD14A","WDR74")),],
+             aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  geom_label_repel(data=pc1_loadings[intersect(rownames(pc1_loadings),c("ANKS1A")),],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkred") +
+  geom_label_repel(data=pc1_loadings[intersect(rownames(pc1_loadings),
+                                               c("SLC25A38","RSAD1","LY9","ZNHIT6","TSEN54","ABHD14A","WDR74")),],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+I further tested if any of the "T cell effectorness genes" identified throughout my PhD were enriched in the extremes of PC1 loadings.
+```{r load_effectorness_genes, message=FALSE, warning=FALSE}
+effectorness_genes <- read_tsv("/well/jknight/eddie/resources/effectornessGenes_restingTcells_phase1.txt")
+```
+
+Some enrichment might exist, but it is not clear cut.
+```{r plot_pc1_loadings_of_effectorness_genes, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank, y=PC1)) + 
+  geom_point() +
+  geom_point(data=pc1_loadings[intersect(rownames(pc1_loadings),effectorness_genes$gene_name),],
+             aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  geom_label_repel(data=pc1_loadings[rownames(pc1_loadings) %in% effectorness_genes$gene_name & pc1_loadings$gene_rank > nrow(pc1_loadings) - 300,],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  geom_label_repel(data=pc1_loadings[rownames(pc1_loadings) %in% effectorness_genes$gene_name & pc1_loadings$gene_rank < 300,],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+This is especially suggested by the difference in rank distribution compared to an expectation under a random set of genes.
+```{r plot_effectorness_genes_rank_density, message=FASLE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank)) + 
+  geom_density() +
+  geom_density(data=pc1_loadings[intersect(rownames(pc1_loadings),effectorness_genes$gene_name),],
+             aes(x=gene_rank), color="darkblue") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Finally, I tested whether the SRS signature is similar to the signature defined by Lee et al. for patient stratification in IBD (and replicated across several autoimmune diseases):
+```{r load_IBD_signature_genes, message=FALSE, warning=FALSE}
+IBD_signature <- read_csv("/well/jknight/eddie/resources/Lee-et-al_2019_Gut_Classifier-genes.csv")
+```
+
+Some enrichment might exist, but it is not clear cut.
+```{r plot_pc1_loadings_of_IBD_signature_genes, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank, y=PC1)) + 
+  geom_point() +
+  geom_point(data=pc1_loadings[intersect(rownames(pc1_loadings),IBD_signature$gene_id),],
+             aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  geom_label_repel(data=pc1_loadings[rownames(pc1_loadings) %in% IBD_signature$gene_id & pc1_loadings$gene_rank > nrow(pc1_loadings) - 500,],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  geom_label_repel(data=pc1_loadings[rownames(pc1_loadings) %in% IBD_signature$gene_id & pc1_loadings$gene_rank < 500,],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkblue") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+```{r plot_IBD_signature_genes_rank_density, message=FASLE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank)) + 
+  geom_density() +
+  geom_density(data=pc1_loadings[intersect(rownames(pc1_loadings),IBD_signature$gene_id),],
+             aes(x=gene_rank), color="darkblue") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+### Uniform Manifold Approximation and Projection (UMAP)
+However, there might be more than one principal component capturing relevant variation. Thus, we estimate the proportion of variance explained by each component.
+
+This plot reveals that all of the first 15 PCs explain more than 1% of the variance.
+```{r plot_variance_explained_by_pcs, message=FALSE, warning=FALSE, echo=FALSE}
+pc_variance <- pca$sdev^2/sum(pca$sdev^2)
+plot(pc_variance[1:50], type="b", cex=0.5, xlab="Principal Component", ylab="Proportion of variance explained")
+abline(h = 0.01)
+```
+Thus, we take the first 10 PCs and embed them into a 2-dimensional space using the UMAP algorithm.
+```{r perform_umap, message=FALSE, warning=FALSE}
+umap_res <- umap(pc_coords[,1:10])
+umap_coords <- data.frame(umap_res$layout)
+colnames(umap_coords) <- c("UMAP1","UMAP2")
+
+umap_coords <- cbind(umap_coords, colData(gains_microarray))
+```
+
+A simple visual inspection again reinforces the conclusion that there is no separation by batch.
+```{r plot_umap_by_batch, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(umap_coords, aes(x=UMAP1, y=UMAP2)) + 
+  geom_point(aes(color=Batch), size=3) +
+  scale_color_manual(values = c("#a6cee3","#1f78b4","#b2df8a","#33a02c")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Again, there is separation by time point of sampling.
+```{r plot_umap_by_day, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(umap_coords, aes(x=UMAP1, y=UMAP2)) + 
+  geom_point(aes(color=as.factor(Day)), size=3) +
+  scale_color_manual(values = c("#a1dab4","#41b6c4","#225ea8")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+The main separation, however, is again by SRS group.
+```{r plot_umap_by_srs, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(umap_coords, aes(x=UMAP1, y=UMAP2)) + 
+  geom_point(aes(color=as.factor(SRS)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), na.value="lightgrey", name="Endotype", labels=c("SRS1","SRS2")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Analysing day 1 samples only
+Because there seems to be a correlation between SRS group membership and time point of collection (probably generated by sampling bias, with many SRS1 patients only donating samples at day 1), I now repeat the principal component analysis using only samples acquired at day 1 post admission.
+```{r perform_pca_for_day1_samples, message=FALSE, warning=FALSE}
+gains_day1 <- gains_microarray[,gains_microarray@colData$Day %in% c(1)]
+pca <- prcomp(t(assay(gains_day1)))
+
+pc_coords <- data.frame(cbind(pca$x,colData(gains_day1)))
+pc_variance <- pca$sdev^2/sum(pca$sdev^2)
+```
+
+Now only one time point is kept.
+```{r plot_umap_by_day_for_day1_samples, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(Day)), size=3) +
+  scale_color_manual(values = c("#a1dab4","#41b6c4","#225ea8")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Here there also seems to be no separation by batch
+```{r plot_pca_by_batch_for_day1_samples, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=Batch), size=3) +
+  scale_color_manual(values = c("#a6cee3","#1f78b4","#b2df8a","#33a02c")) +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Separation by SRS group is still the main source of variation.
+```{r plot_pca_by_srs_for_day1_samples, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(SRS)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), na.value="lightgrey") +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+Exploring PC1 loadings
+```{r get_PC_loadings_for_day1_samples, message=FALSE, warning=FALSE}
+# Extracting loadings for the first 10 PCs
+pc_loadings <- data.frame(gene = rownames(pca$rotation),
+                           pca$rotation[,1:10])
+```
+
+```{r plot_pc1_loadings+for_day1_samples, message=FALSE, warning=FALSE, echo=FALSE}
+pc1_loadings <- pc_loadings[order(pc_loadings$PC1),]
+pc1_loadings$gene_rank <- 1:nrow(pc1_loadings)
+
+ggplot(pc1_loadings, aes(x=gene_rank, y=PC1)) + 
+  geom_point() +
+  geom_label_repel(data=pc1_loadings[1:20,], aes(x=gene_rank, y=PC1, label=gene), size=3) +
+  geom_label_repel(data=pc1_loadings[(nrow(pc1_loadings)-20):nrow(pc1_loadings),], 
+                   aes(x=gene_rank, y=PC1, label=gene), size=3) +
+  ylim(-0.25,0.1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Checking the distribution of the 7 SRS signature genes
+```{r plot_pc1_loadings_of_classifier_genes_for_day1_samples, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank, y=PC1)) + 
+  geom_point() +
+  geom_point(data=pc1_loadings[intersect(rownames(pc1_loadings),SRS_genes),],
+             aes(x=gene_rank, y=PC1, label=gene), size=3, color="red") +
+  geom_label_repel(data=pc1_loadings[intersect(rownames(pc1_loadings),SRS_genes),],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="red") +
+  ylim(-0.25,0.1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+Testing if T cell effectorness genes are still enriched in the tails of the PC1 loadings distribution.
+```{r plot_pc1_loadings_of_effectorness_genes_for_day1_samples, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank, y=PC1)) + 
+  geom_point() +
+  geom_point(data=pc1_loadings[intersect(rownames(pc1_loadings),effectorness_genes$gene_name),],
+             aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkred") +
+  geom_label_repel(data=pc1_loadings[rownames(pc1_loadings) %in% effectorness_genes$gene_name & pc1_loadings$gene_rank > nrow(pc1_loadings) - 300,],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkred") +
+  geom_label_repel(data=pc1_loadings[rownames(pc1_loadings) %in% effectorness_genes$gene_name & pc1_loadings$gene_rank < 300,],
+                   aes(x=gene_rank, y=PC1, label=gene), size=3, color="darkred") +
+  ylim(-0.25,0.1) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+```{r plot_effectorness_genes_rank_density_for_day1_samples, message=FASLE, warning=FALSE, echo=FALSE}
+ggplot(pc1_loadings, aes(x=gene_rank)) + 
+  geom_density() +
+  geom_density(data=pc1_loadings[intersect(rownames(pc1_loadings),effectorness_genes$gene_name),],
+             aes(x=gene_rank), color="darkblue") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Exploring the 7-gene signature of SRS subgroups
+Extracting the expression measurements for all 7 genes in the SRS signature
+```{r extract_srs_genes, message=FALSE, warning=FALSE}
+SRS_genes_expression <- data.frame(cbind(t(assay(gains_microarray)[SRS_genes,])),colData(gains_microarray))
+```
+
+The plot below shows the expression level of each gene in the signature across all individual in the study. Individuals are labeled as SRS1 or SRS2, respectively.
+```{r plot_srs_gene_heatmap, message=FALSE, warning=FALSE, echo=FALSE}
+pheatmap(SRS_genes_expression[,1:7], 
+         show_rownames = F, 
+         color = colorRampPalette(c("darkblue","white","darkred"))(100), 
+         cellwidth = 20,
+         scale = "none",
+         annotation_row = data.frame(SRS=as.factor(colData(gains_microarray)$SRS), row.names = colnames(gains_microarray)))
+```
+
+In order to be able to compare genes with widely different expression ranges, we re-scale the expression values to the [0,1] range by subtracting the minimum and dividing by the range. Note that I am adding 0.01 to avoid zero divisions further down the line.
+```{r scale_genes, message=FALSE, warning=FALSE}
+SRS_genes_scaled <- apply(SRS_genes_expression[,1:7], MARGIN=2, FUN=function(dat){
+  (dat-min(dat))/(max(dat)-min(dat))
+})
+SRS_genes_scaled <- SRS_genes_scaled + 0.01
+SRS_genes_scaled <- data.frame(cbind(SRS_genes_scaled, colData(gains_microarray)))
+```
+
+This clears the heatmap a little
+```{r plot_srs_gene_heatmap_scaled, message=FALSE, warning=FALSE, echo=FALSE}
+pheatmap(SRS_genes_scaled[,1:7], 
+         show_rownames = F, 
+         color = colorRampPalette(c("darkblue","white","darkred"))(100), 
+         cellwidth = 20,
+         scale = "none",
+         annotation_row = data.frame(SRS=as.factor(colData(gains_microarray)$SRS), 
+                                     row.names = colnames(gains_microarray)))
+```
+
+A strong correlation structure between all of these genes is now apparent. We can explore this in more detail by computing the correlation matrix between the scaled expression values for all of these 7 genes across all individual in the cohort.
+```{r corrplot_srs_genes, message=FALSE, warning=FALSE, echo=FALSE}
+corrplot(cor(SRS_genes_scaled[,1:7]), 
+         type = "upper", 
+         method = "ellipse")
+```
+
+## Replicating original prediction model
+I now reconstruct the SRS classifier presented in the original GAinS paper, based on these 7 genes. I start by defining a training data set, which contains all samples for which SRS group membership is known from unsupervised clustering (475 samples, which is roughly 70% of the data).
+```{r define_training_data, message=FALSE, warning=FALSE}
+training_data <- SRS_genes_expression[!is.na(SRS_genes_expression$SRS),c(SRS_genes,"SRS")]
+training_data$SRS <- factor(training_data$SRS)
+```
+
+I then perform a logistic regression using the glm function, where the predictor variables are the expression levels of the 7 genes in the signature and the variable to predict is SRS group.
+
+The performance of the classifier in the training data is evaluated using leave one out cross-validation (LOOCV). In short, we remove one sample from the dataset at a time, build a classifier based on the remaining samples, and then predict the SRS membership of the sample which was left out. 
+```{r loocv, message=FALSE, warning=FALSE}
+results <- matrix(NA, nrow=nrow(training_data), ncol=2)
+results[, 1] <- training_data$SRS
+
+for(i in 1:nrow(training_data)){
+  model <- glm(SRS ~ ., data=training_data[-i, ], family = binomial(logit))
+  results[i, 2] <- predict(model, newdata = training_data[i, 1:7], type="response")
+}
+results <- data.frame(results)
+colnames(results) <- c("SRS","probability")
+```
+
+If assign the SRS2 group to any sample with a predicted probability(SRS2) > 0.5, then we obtain the following confusion matrix.
+```{r get_confusion_matrix, message=FALSE, warning=FALSE}
+table(results$SRS, results$probability > 0.5)
+```
+
+Based on this matrix, we can compute a few simple performance metrics for the classifier. However, we should keep in mind that these are not true sensitivity, specificity and precision values, since we are only evaluating the method on the training set. These will thus be inflated. Unfortunately, there are no ground truth labels in the validation set.
+```{r metrics, message=FALSE, warning=FALSE}
+TP <- sum(results$SRS == 2 & results$probability > 0.5)
+FN <- sum(results$SRS == 2 & results$probability < 0.5)
+TN <- sum(results$SRS == 1 & results$probability < 0.5)
+FP <- sum(results$SRS == 1 & results$probability > 0.5)
+
+print(paste("Sensitivity/Recall: ", round(TP/(TP+FN),2)))
+print(paste("Specificity: ", round(TN/(TN+FP),2)))
+print(paste("Precision: ", round(TP/(TP+FP),2)))
+```
+
+We can also visualise this using a histogram of predicted probabilities, coloured by true SRS membership.
+```{r plot_predictions, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(results, aes(probability)) +
+  geom_histogram(bins=100, aes(group=SRS, fill=as.factor(SRS))) +
+  scale_fill_manual(values=c("#ef8a62","#67a9cf"), name="SRS group") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+We can also explore the full set of potential thresholds using a ROC curve. We compute performance metrics using functions in the ROCR package.
+```{r estimate_performance_metrics, message=FALSE, warning=FALSE}
+pred <- prediction(predictions = results$probability,
+                   labels = results$SRS)
+perf <- performance(pred, measure="tpr", x.measure = "fpr")
+```
+
+This results in the following ROC curve.
+```{r plot_ROC, message=FALSE, warning=FALSE, echo=FALSE}
+plot(perf, main="ROC curve for SRS prediction using logistic regression")
+abline(a=0, b=1, lwd=2, lty=2)
+```
+
+The area under this curve is as follows
+```{r calcualte_AUROC, message=FALSE, warning=FALSE}
+performance(pred, measure = "auc")@y.values
+```
+
+Worth reiterating that this is not a true AUROC though, as it is calculated based on the classifier's performance in the training set.
+
+Based on the leave-one-out cross-validation results, this seems like a fairly good classifier. We thus train it in the entirety of the training data set.
+```{r train_classifier, message=FALSE, warning=FALSE}
+full_model <- glm(SRS ~ ., data=training_data, family = binomial(logit))
+```
+
+We now predict the SRS groups for all samples in the microarray dataset.
+```{r predict_SRS_groups, message=FALSE, warning=FALSE}
+predicted_probabilities <- predict(full_model, 
+        newdata = SRS_genes_expression[,SRS_genes],
+        type="response")
+
+pc_coords$predicted_SRS <- sapply(predicted_probabilities, FUN=function(p){
+  if(p > 0.5){
+    return(2)
+  } else{
+    return(1)
+  }
+})
+```
+
+This seems to have worked based on a simple visual inspection
+```{r plot_pca_by_predicted_srs, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(predicted_SRS)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), na.value="lightgrey", name="Predicted endotype", labels=c("SRS1","SRS2")) +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  ggtitle("Predictions from raw expression-based classifier") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(size=14, hjust=0.5))
+```
+These predictions agree with the labels from unsupervised clustering in:
+```{r estimate_prediction_overlap_raw, message=FALSE, warning=FALSE}
+paste(round(mean(pc_coords$predicted_SRS == pc_coords$SRS, na.rm=T)*100,2), "% of instances", sep="")
+```
+
+
+We save the trained model for further reference and for predicting SRS membership in future data sets.
+```{r export_SRS_classifier, message=FALSE, warning=FALSE, eval=FALSE}
+saveRDS(full_model, "/well/jknight/eddie/consensus_endotyping/results/SRS-classifier_7-genes_glm-of-raw-values.rds")
+```
+
+
+## Identifying potential new predictor variables
+Classifying based on expression measurements directly is not ideal, since these will change across technologies and platforms (i.e. RNA-seq vs microarray vs qPCR). Bearing this structure in mind, one could hypothesise using gene:gene ratios, which should be more stable even if measured using different technologies. However, since there is a strong correlation structure for these 7 genes, it is probably too redundant to calculate multiple gene ratios based on combinations of them. However, to trial the approach any way, I visualise here a few log-ratios of genes in the signature (I use a log transformation here to make the ratios symmetric). Here, TDRD9 is taken as a reference for all ratios, since it anti-correlates with the other 6 genes.
+
+```{r plot_gene_ratios_to_TDRD9, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(SRS_genes_expression, aes(x=as.factor(SRS), y=log2(ZAP70/TDRD9))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_expression, aes(x=as.factor(SRS), y=log2(C11ORF46/TDRD9))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_expression, aes(x=as.factor(SRS), y=log2(EMR3/TDRD9))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_expression, aes(x=as.factor(SRS), y=log2(MDC1/TDRD9))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_expression, aes(x=as.factor(SRS), y=log2(DYRK2/TDRD9))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_expression, aes(x=as.factor(SRS), y=log2(CCNB1IP1/TDRD9))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+These ratios-to-TDRD9 seem to separate well SRS1 vs SRS2 and would thus be good candidates for predictor variables in a classifier, especially the EMR3:TDRD9 ratio.
+
+However, again, these features are not independent and most log-ratios are actually representing the same information here:
+```{r heatmap_of_log_ratios, message=FALSE, warning=FALSE, echo=FALSE}
+pheatmap(log2(SRS_genes_expression[,c(1:5,7)]/SRS_genes_expression$TDRD9),
+         show_rownames = FALSE,
+         color = colorRampPalette(c("darkblue","white","darkred"))(100), 
+         cellwidth = 20,
+         scale = "none",
+         annotation_row = data.frame(SRS=as.factor(colData(gains_microarray)$SRS), 
+                                     row.names = colnames(gains_microarray)))
+```
+
+
+Importantly, this relationship seems to be preserved after scaleing the genes to the [0,1] range.
+```{r plot_gene_ratios_to_TDRD9_scaled, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(ZAP70/TDRD9))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(C11ORF46/TDRD9))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(EMR3/TDRD9))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(MDC1/TDRD9))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(DYRK2/TDRD9))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(CCNB1IP1/TDRD9))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+But the strong correlation across ratios is even more apparent here.
+```{r heatmap_of_ratios_scaled, message=FALSE, warning=FALSE, echo=FALSE}
+pheatmap(log2(SRS_genes_scaled[,c(1:5,7)]/SRS_genes_scaled$TDRD9),
+         show_rownames = FALSE,
+         color = colorRampPalette(c("darkblue","white","darkred"))(100), 
+         cellwidth = 20,
+         scale = "none",
+         annotation_row = data.frame(SRS=as.factor(colData(gains_microarray)$SRS), 
+                                     row.names = colnames(gains_microarray)))
+```
+
+This is even more clear in a correlation plot.
+```{r correlation_of_ratios, message=FALSE, warning=FALSE, echo=FALSE}
+corrplot(cor(log2(SRS_genes_scaled[,c(1:5,7)]/SRS_genes_scaled$TDRD9)), 
+         type = "upper", 
+         method = "ellipse")
+```
+
+All of this is further complicated by the fact that combinations (i.e. ratios) of the other 6 genes are not nearly as good as potential predictors, as shown in the plots below for 
+
+A) ZAP70:
+```{r plot_gene_ratios_to_ZAP70_scaled, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(TDRD9/ZAP70))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(C11ORF46/ZAP70))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(EMR3/ZAP70))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_expression, aes(x=as.factor(SRS), y=log2(MDC1/ZAP70))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(DYRK2/ZAP70))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(CCNB1IP1/ZAP70))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+B) EMR3:
+```{r plot_gene_ratios_to_EMR3_scaled, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(TDRD9/EMR3))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(C11ORF46/EMR3))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(ZAP70/EMR3))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(MDC1/EMR3))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(DYRK2/EMR3))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggplot(SRS_genes_scaled, aes(x=as.factor(SRS), y=log2(CCNB1IP1/EMR3))) + 
+  geom_boxplot() +
+  geom_jitter(width=0.2, alpha=0.2) +
+  geom_hline(yintercept = 0, color="red") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+```
+
+We could, rather naively, take forward all the ratios against TDRD9 as predictors into the same logistic regression framework shown above.
+
+We again define the training set.
+```{r define_training_set_for_ratios, message=FALSE, warning=FALSE}
+# Subsetting samples
+training_data_ratios <- SRS_genes_scaled[!is.na(SRS_genes_scaled$SRS),c(SRS_genes,"SRS")]
+
+# Calculating log2 gene ratios to TDRD9
+training_data_ratios <- cbind(log2(training_data_ratios[,c(1:5,7)]/training_data_ratios$TDRD9),
+                              SRS=factor(training_data_ratios$SRS))
+colnames(training_data_ratios)[1:6] <- paste(colnames(training_data_ratios)[1:6], ":TDRD9", sep="")
+```
+
+Performing leave one out cross-validation.
+```{r loocv_for_ratios, message=FALSE, warning=FALSE}
+results_ratios <- matrix(NA, nrow=nrow(training_data_ratios), ncol=2)
+results_ratios[, 1] <- training_data_ratios$SRS
+
+for(i in 1:nrow(training_data_ratios)){
+  model <- glm(SRS ~ ., data=training_data_ratios[-i, ], family = binomial(logit))
+  results_ratios[i, 2] <- predict(model, newdata = training_data_ratios[i, 1:6], type="response")
+}
+results_ratios <- data.frame(results_ratios)
+colnames(results_ratios) <- c("SRS","probability")
+```
+
+Visualising confusion matrix
+```{r get_confusion_matrix_for_ratios, message=FALSE, warning=FALSE}
+table(results_ratios$SRS, results_ratios$probability > 0.5)
+```
+
+Calculating performance metrics based on a 0.5 probability(SRS2) threshold.
+```{r metrics_for_ratios, message=FALSE, warning=FALSE}
+TP <- sum(results_ratios$SRS == 2 & results_ratios$probability > 0.5)
+FN <- sum(results_ratios$SRS == 2 & results_ratios$probability < 0.5)
+TN <- sum(results_ratios$SRS == 1 & results_ratios$probability < 0.5)
+FP <- sum(results_ratios$SRS == 1 & results_ratios$probability > 0.5)
+
+print(paste("Sensitivity/Recall: ", round(TP/(TP+FN),2)))
+print(paste("Specificity: ", round(TN/(TN+FP),2)))
+print(paste("Precision: ", round(TP/(TP+FP),2)))
+```
+
+We can now generate a new ROC curves in order to compare the performance from both models.
+```{r estimate_performance_metrics_for_ratios, message=FALSE, warning=FALSE}
+pred_ratios <- prediction(predictions = results_ratios$probability,
+                   labels = results_ratios$SRS)
+perf_ratios <- performance(pred_ratios, measure="tpr", x.measure = "fpr")
+```
+
+This results in the following curve.
+```{r plot_ROC_for_ratios, message=FALSE, warning=FALSE, echo=FALSE}
+plot(perf_ratios, main="SRS prediction using logistic regression on log-ratios", col="darkred")
+abline(a=0, b=1, lwd=2, lty=2)
+```
+The AUROC has decreased to:
+```{r calcualte_AUROC_for_ratios, message=FALSE, warning=FALSE}
+performance(pred_ratios, measure = "auc")@y.values
+```
+
+We now train the classifier using the entirety of the training data.
+```{r train_classifier_ratios, message=FALSE, warning=FALSE}
+full_logratios_model <- glm(SRS ~ ., data=training_data_ratios, family = binomial(logit))
+```
+
+Finally, we predict the SRS groups for all samples in the microarray dataset based on this new classifier.
+```{r predict_SRS_groups_from_ratios, message=FALSE, warning=FALSE}
+# Calculate ratios for full data set
+SRS_logratios <- SRS_genes_scaled[,1:7]
+
+SRS_logratios <- log2(SRS_logratios[,c(1:5,7)]/SRS_logratios$TDRD9)
+colnames(SRS_logratios) <- paste(colnames(SRS_logratios), ":TDRD9", sep="")
+
+# Predicting SRS groups
+predicted_probabilities_ratios <- predict(full_logratios_model, 
+        newdata = SRS_logratios,
+        type="response")
+
+pc_coords$predicted_SRS_ratios <- sapply(predicted_probabilities_ratios, FUN=function(p){
+  if(p > 0.5){
+    return(2)
+  } else{
+    return(1)
+  }
+})
+```
+
+This seems to have worked based on a simple visual inspection
+```{r plot_pca_by_predicted_srs, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(predicted_SRS_ratios)), size=3) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), na.value="lightgrey", name="Predicted endotype", labels=c("SRS1","SRS2")) +
+  ggtitle("Prediction from ratios-based classifier") +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        plot.title = element_text(size=14, hjust=0.5))
+```
+These predictions overlap with the labels from unsupervised clustering in:
+```{r estimate_prediction_overlap_ratios, message=FALSE, warning=FALSE}
+paste(round(mean(pc_coords$predicted_SRS_ratios == pc_coords$SRS, na.rm=T)*100,2), "% of instances", sep="")
+```
+
+Furthermore, predictions from both classifiers agree for:
+```{r estimate_model_agreement, message=FALSE, warning=FALSE}
+paste(round(mean(pc_coords$predicted_SRS_ratios == pc_coords$predicted_SRS, na.rm=T)*100,2), "% of instances", sep="")
+```
+
+We save the trained log-based model for further reference and for predicting SRS membership in future data sets.
+```{r export_SRS_classifier, message=FALSE, warning=FALSE, eval=FALSE}
+saveRDS(full_logratios_model,
+        "/well/jknight/eddie/consensus_endotyping/results/SRS-classifier_7-genes_glm-of-log2-gene-ratios.rds")
+```
+
+## Some limitations of this analysis
+1. Is averaging microarray probes the correct approach? I've noticed that people tend to treat them as separate measurements in some publications
+2. Should I be using all time points for this analysis? Perhaps it would be better to focus on transcriptomic profiles upon admission (i.e. day 1). Additionally, there is the issue of correlation structure between time points for the same individual. Is it fair to treat these as independent data points? Most likely it isn't.
+3. In Emma's paper, they use the top 10% most variable probes. I too tried repeating the analysis using several thresholds for gene filtering by variability, however only 1 out of 7 SRS signature genes is amongst the top 2000 variable genes. Why is this the case?
+4. When selecting predictor variables for a classifier, how is it best to deal with a strong underlying correlation structure? It is clear that these variables are not truly independent, and could thus not be fed as they are into a classifier
+
+## Potential future avenues
+1. Are there any methods to identify independent features (i.e. orthogonal, non correlated) in a dataset? We could pass the dataset through such a method to obtain a set of independent variables for ratio calcualtion. However, is this even theoretically sound, since you'd expect variables that predict SRS membership to be correlated with one another, given that they define the endotype in the first place?
+2. Is there a different work around which is not based on ratios but is robust across gene expression measurement platforms?
+
+## Session details
+```{r r_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```

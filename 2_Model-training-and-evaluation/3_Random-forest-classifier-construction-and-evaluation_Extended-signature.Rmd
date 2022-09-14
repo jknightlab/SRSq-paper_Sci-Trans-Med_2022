@@ -1,0 +1,2505 @@
+---
+title: "Classification of whole blood samples into sepsis response groups based on an expanded set of predictor genes"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(reshape2)
+library(SummarizedExperiment)
+library(survival)
+library(survminer)
+library(batchelor)
+library(caret)
+library(limma)
+library(XGR)
+library(destiny)
+library(zoo)
+library(pROC)
+library(ROCR)
+library(mediation)
+library(UpSetR)
+library(ggpubr)
+library(ggrepel)
+library(cowplot)
+```
+
+## Loading data
+Whole blood gene expression data of sepsis patients in the GAinS study profiled using different technologies:
+```{r load_gains_data, message=FALSE, warning=FALSE}
+gains_microarray <- readRDS("../data/gains_gex/gains_full_microarray_dedup_norm_combat_average-per-gene.rds")
+gains_RNAseq <- readRDS("../data/gains_gex/gains_full_RNAseq_norm_log2-cpm.rds")
+```
+
+Whole blood gene expression data of three cohorts of healthy individuals, profiled using different technologies.
+```{r load_healthy_data, message=FALSE, warning=FALSE}
+dutch500FG <- readRDS("../data/Aguirre-Gamboa-et-al_2020_BMC-bioinformatics/dutch500FG_RNA-seq_log2-cpm.rds")
+SHIP_TREND <- readRDS("../data/SHIP-TREND/SHIP-TREND_microarray_averaged-per-gene.rds")
+inouye <- readRDS("../data/Inouye-et-al_2010_PLOS-genetics/Inouye-et-al_microarray_averaged-per-gene.rds")
+```
+
+## Fetching predictor variables
+Loading an expanded set of 19 predictor genes comprising the 7 genes originally proposed by Davenport et al. plus an additional 12 genes derived from joint CCA analysis of GAinS RNA-seq and microarray data. 
+```{r load_predictor_genes, message=FALSE, warning=FALSE}
+predictor_genes <- read.table("../results/extended-predictor-gene-set.tsv", sep="\t", header=T)
+```
+
+Fetching expression values for the predictor genes in all data sets.
+```{r fetch_predictor_genes, message=FALSE, warning=FALSE}
+# GAinS
+gains_microarray_predictors <- data.frame(t(assay(gains_microarray[predictor_genes$ILMN_gene,])))
+colnames(gains_microarray_predictors) <- predictor_genes$gene_id
+
+gains_RNAseq_predictors <- data.frame(t(assay(gains_RNAseq[predictor_genes$gene_id,])))
+
+# dutch500FG
+dutch500FG_predictors <- data.frame(t(assay(dutch500FG[predictor_genes$gene_id,])))
+
+# SHIP-TREND
+ship_trend_predictors <- data.frame(t(assay(SHIP_TREND[predictor_genes$ILMN_gene,])))
+colnames(ship_trend_predictors) <- predictor_genes$gene_id
+
+# Inouye et al
+inouye_predictors <- data.frame(t(assay(inouye[predictor_genes$ILMN_gene,])))
+colnames(inouye_predictors) <- predictor_genes$gene_id
+```
+
+
+## Integrating predictor variables from all data sets into a reference set
+```{r build_reference_set, message=FALSE, warning=FALSE}
+reference_set <- data.frame(
+  
+  rbind(
+    gains_microarray_predictors,
+    gains_RNAseq_predictors,
+    dutch500FG_predictors,
+    ship_trend_predictors,
+    inouye_predictors),
+  
+  row.names = c(paste(rownames(gains_microarray_predictors),"IlluminaHT",sep="_"),
+                paste(rownames(gains_RNAseq_predictors),"RNAseq",sep="_"),
+                rownames(dutch500FG_predictors),
+                rownames(ship_trend_predictors),
+                rownames(inouye_predictors))
+  )
+```
+
+## Visualising reference set
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca_reference_set <- prcomp(reference_set)
+```
+
+```{r fetch_pc_coordinates, message=FALSE, warning=FALSE}
+pc_coords_reference_set <- data.frame(pca_reference_set$x)
+pc_coords_reference_set$SRS_unsup <- c(gains_microarray$SRS,
+                                gains_RNAseq$SRSUnsup,
+                                rep("SRS3", nrow(dutch500FG_predictors)),
+                                rep("SRS3", nrow(ship_trend_predictors)),
+                                rep("SRS3", nrow(inouye_predictors)))
+pc_coords_reference_set$SRS_model <- c(gains_microarray$SRS_New,
+                                      gains_RNAseq$SRSModel,
+                                      rep("SRS3", nrow(dutch500FG_predictors)),
+                                      rep("SRS3", nrow(ship_trend_predictors)),
+                                      rep("SRS3", nrow(inouye_predictors)))
+pc_coords_reference_set$Study <- c(rep("GAinS", nrow(gains_microarray_predictors)),
+                                  rep("GAinS", nrow(gains_RNAseq_predictors)),
+                                  rep("dutch500FG", nrow(dutch500FG_predictors)),
+                                  rep("SHIP-TREND", nrow(ship_trend_predictors)),
+                                  rep("FINRISK", nrow(inouye_predictors)))
+pc_coords_reference_set$Assay <- c(rep("IlluminaHT", nrow(gains_microarray_predictors)),
+                                  rep("RNAseq", nrow(gains_RNAseq_predictors)),
+                                  rep("RNAseq", nrow(dutch500FG_predictors)),
+                                  rep("IlluminaHT", nrow(ship_trend_predictors)),
+                                  rep("IlluminaHT", nrow(inouye_predictors)))
+```
+
+
+```{r plot_pca, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords_reference_set, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=Assay, shape=Study), size=3) +
+  theme_classic()
+
+ggplot(pc_coords_reference_set[is.na(pc_coords_reference_set$SRS_unsup),], aes(x=PC1, y=PC2)) +
+  geom_point(color="lightgrey", size=3) +
+  geom_point(data=pc_coords_reference_set[!is.na(pc_coords_reference_set$SRS_unsup),], aes(x=PC1, y=PC2, color=SRS_unsup, shape=Assay), size=3) +
+  scale_color_manual(values=c("darkblue","steelblue","lightblue")) +
+  theme_classic()
+
+ggplot(pc_coords_reference_set, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=SRS_model, shape=Assay), size=3) +
+  scale_color_manual(values=c("darkblue","steelblue","lightblue"), na.value="lightgrey") +
+  theme_classic()
+```
+
+## Aligining data from different assays using mutual nearest neighbours (mNN)
+Defining batches
+```{r define_batches, message=FALSE, warning=FALSE}
+batch <- c(rep(1, nrow(gains_microarray_predictors)),
+           rep(2, nrow(gains_RNAseq_predictors)),
+           rep(2, nrow(dutch500FG_predictors)),
+           rep(3, nrow(ship_trend_predictors)),
+           rep(1, nrow(inouye_predictors)))
+```
+
+Aligning batches with the mutual nearest neighbours (mNN) algorithm
+```{r align_batches, message=FALSE, warning=FALSE}
+reference_set_aligned <- data.frame(t(assay(mnnCorrect(t(reference_set), 
+                                                       batch = batch, 
+                                                       merge.order = list(1,2,3),
+                                                       k = 500))))
+
+
+```
+
+Re-computing principal components
+```{r perform_pca_aligned, message=FALSE, warning=FALSE}
+pca_reference_set <- prcomp(reference_set_aligned)
+```
+
+```{r fetch_pc_coords_aligned, message=FALSE, warning=FALSE}
+pc_coords_reference_set <- data.frame(pca_reference_set$x)
+pc_coords_reference_set$SRS_unsup <- c(
+  gsub("2","SRS2",gsub("1","SRS1",gains_microarray$SRS)),
+  gsub("2","SRS2",gsub("1","SRS1",gains_RNAseq$SRSUnsup)),
+  rep("SRS3", nrow(dutch500FG_predictors)),
+  rep("SRS3", nrow(ship_trend_predictors)),
+  rep("SRS3", nrow(inouye_predictors)))
+pc_coords_reference_set$SRS_model <- c(gains_microarray$SRS_New,
+                                 gains_RNAseq$SRSModel,
+                                 rep("SRS3", nrow(dutch500FG_predictors)),
+                                 rep("SRS3", nrow(ship_trend_predictors)),
+                                 rep("SRS3", nrow(inouye_predictors)))
+pc_coords_reference_set$Study <- c(rep("GAinS", nrow(gains_microarray_predictors)),
+                             rep("GAinS", nrow(gains_RNAseq_predictors)),
+                             rep("dutch500FG", nrow(dutch500FG_predictors)),
+                             rep("SHIP-TREND", nrow(ship_trend_predictors)),
+                             rep("FINRISK", nrow(inouye_predictors)))
+pc_coords_reference_set$Assay <- c(rep("IlluminaHT", nrow(gains_microarray_predictors)),
+                             rep("RNAseq", nrow(gains_RNAseq_predictors)),
+                             rep("RNAseq", nrow(dutch500FG_predictors)),
+                             rep("IlluminaHT", nrow(ship_trend_predictors)),
+                             rep("IlluminaHT", nrow(inouye_predictors)))
+```
+
+Visualising reference set after alignment
+```{r plot_pca_aligned, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords_reference_set, aes(x=-PC1, y=PC2)) +
+  geom_point(aes(color=Study), size=3) +
+  theme_classic()
+
+ggplot(pc_coords_reference_set, aes(x=-PC1, y=PC2)) +
+  geom_point(aes(color=Assay), size=3) +
+  theme_classic()
+
+ggplot(pc_coords_reference_set[is.na(pc_coords_reference_set$SRS_unsup),], aes(x=-PC1, y=PC2)) +
+  geom_point(aes(shape=Assay), color="lightgrey", size=3) +
+  geom_point(data=pc_coords_reference_set[!is.na(pc_coords_reference_set$SRS_unsup),], aes(x=-PC1, y=PC2, color=SRS_unsup, shape=Assay), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  theme_classic()
+
+ggplot(pc_coords_reference_set, aes(x=-PC1, y=PC2)) +
+  geom_point(aes(color=SRS_model, shape=Assay), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue"), na.value="lightgrey") +
+  scale_shape_manual(values=c("circle","square")) +
+  theme_classic()
+```
+
+Exporting reference set for future reference and mNN alignments
+```{r export_reference_set, eval=FALSE}
+write.table(reference_set_aligned,
+            "../results/classifier_models/reference-set-for-mNN-alignment_extended-gene-set.tsv",
+            sep="\t", quote=F)
+```
+
+# Splitting reference set into training and testing
+Defining training samples
+```{r define_training_samples, message=FALSE, warning=FALSE}
+# GAinS
+training_samples_microarray <- as.tibble(colData(gains_microarray)) %>% 
+  arrange(GAinSID, Day) %>% 
+  filter(!duplicated(GAinSID)) %>% 
+  filter(!is.na(SRS)) %>% 
+  transmute(SampleID = paste(SampleID,"IlluminaHT",sep="_"),
+            SRS = paste("SRS",SRS,sep=""))
+
+training_samples_RNAseq <- as.tibble(colData(gains_RNAseq)) %>% 
+  arrange(GAinSID, Day) %>% 
+  filter(!duplicated(GAinSID)) %>% 
+  filter(!is.na(SRSUnsup)) %>% 
+  transmute(SampleID = paste(SampleID,"RNAseq",sep="_"),
+            SRS = paste("SRS",SRSUnsup,sep=""))
+
+# Healthy cohorts
+training_samples_dutch500FG <- tibble(
+  SampleID = sample(colnames(dutch500FG),70),
+  SRS = "SRS3"
+)
+training_samples_ship_trend <- tibble(
+  SampleID = sample(colnames(SHIP_TREND),100),
+  SRS = "SRS3"
+)
+training_samples_inouye <- tibble(
+  SampleID = sample(colnames(inouye),100),
+  SRS = "SRS3"
+)
+```
+
+Fetching expression values for predictor genes across all training samples
+```{r build_training_set, message=FALSE, warning=FALSE}
+training_set <- data.frame(reference_set_aligned[c(training_samples_microarray$SampleID, 
+                                                   training_samples_RNAseq$SampleID,
+                                                   training_samples_dutch500FG$SampleID,
+                                                   training_samples_ship_trend$SampleID,
+                                                   training_samples_inouye$SampleID),])
+training_set$SRS <- factor(c(training_samples_microarray$SRS,
+                             training_samples_RNAseq$SRS,
+                             training_samples_dutch500FG$SRS,
+                             training_samples_ship_trend$SRS,
+                             training_samples_inouye$SRS))
+```
+
+
+Visualising training vs testing split
+```{r plot_pca_of_training_set, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords_reference_set, aes(x=-PC1, y=PC2)) +
+  geom_point(aes(shape=Assay), color="lightgrey", size=3) +
+  geom_point(data=pc_coords_reference_set[rownames(training_set),], aes(x=-PC1, y=PC2, color=SRS_unsup, shape=Assay), size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) + 
+  scale_shape_manual(values=c("circle","square")) +
+  theme_classic()
+```
+
+# Building classifiers
+## Building a random forest classifier
+Defining parameters for training and cross-validation
+```{r define_rf_parameters, eval=FALSE}
+ctrl <- trainControl(method = "LOOCV", 
+                     classProbs = T,
+                     savePredictions = T)
+grid_rf <- expand.grid(.mtry = c(1,2,3,5,7,9,11))
+```
+
+Training model
+```{r train_rf, eval=FALSE}
+set.seed(1)
+model_rf <- train(SRS~., data=training_set,
+                  method="rf", 
+                  metric="Kappa", 
+                  trControl=ctrl, 
+                  tuneGrid=grid_rf)
+```
+
+```{r load_rf_model, message=FALSE, warning=FALSE, echo=FALSE}
+model_rf <- readRDS("../results/classifier_models/SRS-classifier_extended-19-gene-set_RF_trained-on-mNN-aligned-reference-set.rds")
+```
+
+The model with best performance in the cross-validation was as follows:
+```{r model_rf, message=FALSE, warning=FALSE, echo=FALSE}
+model_rf
+```
+
+Exporting classifier model as an RDS object.
+```{r export_rf_model, eval=FALSE}
+saveRDS(model_rf, "../results/classifier_models/SRS-classifier_extended-19-gene-set_RF_trained-on-mNN-aligned-reference-set.rds")
+```
+
+```{r model_rf_ROCs, message=FALSE, warning=FALSE, echo=FALSE}
+selectedIndices <- model_rf$pred$mtry == model_rf$bestTune$mtry
+
+preds <- model_rf$pred[selectedIndices,c("pred","SRS1","SRS2","SRS3","obs")]
+
+pred_SRS1 <- prediction(predictions = preds$SRS1,
+                      labels = gsub("SRS3","Non-SRS1",gsub("SRS2","Non-SRS1",preds$obs)))
+pred_SRS2 <- prediction(predictions = preds$SRS2,
+                      labels = gsub("SRS3","Non-SRS2",gsub("SRS1","Non-SRS2",preds$obs)))
+pred_SRS3 <- prediction(predictions = preds$SRS3,
+                      labels = gsub("SRS2","Non-SRS3",gsub("SRS1","Non-SRS3",preds$obs)))
+
+perf_SRS1 <- performance(pred_SRS1, measure="tpr", x.measure = "fpr")
+perf_SRS2 <- performance(pred_SRS2, measure="tpr", x.measure = "fpr")
+perf_SRS3 <- performance(pred_SRS3, measure="tpr", x.measure = "fpr")
+
+SRS1_AUROC <- performance(pred_SRS1, measure="auc")@y.values[[1]]
+SRS2_AUROC <- performance(pred_SRS2, measure="auc")@y.values[[1]]
+SRS3_AUROC <- performance(pred_SRS3, measure="auc")@y.values[[1]]
+
+cat("AUROCs:\n\n", 
+    "SRS1 = ", SRS1_AUROC, "\n",
+    "SRS2 = ", SRS2_AUROC, "\n",
+    "SRS3 = ", SRS3_AUROC, "\n",
+    sep=""
+)
+
+
+plot(perf_SRS3@x.values[[1]], perf_SRS3@y.values[[1]],
+     type="l", col="darkblue", lwd=1,
+     xlab="1 - Specificity", ylab="Sensitivity", main="Class-specific ROCs")
+lines(perf_SRS2@x.values[[1]], perf_SRS2@y.values[[1]],
+     col="steelblue", lwd=1)
+lines(perf_SRS1@x.values[[1]], perf_SRS1@y.values[[1]],
+     col="darkred", lwd=1)
+abline(0,1, col="grey")
+```
+
+```{r model_rf_multi_class_AUROC, message=FALSE, warning=FALSE, echo=FALSE}
+selectedIndices <- model_rf$pred$mtry == model_rf$bestTune$mtry
+
+preds <- model_rf$pred[selectedIndices,c("pred","SRS1","SRS2","SRS3")]
+
+roc_multi <- multiclass.roc(response = preds$pred,
+                            predictor = preds[,2:4],
+                            formula = response~predictor,
+                            data=model_rf$pred$obs[selectedIndices],
+                            levels=c("SRS1","SRS2","SRS3"))
+roc_multi$auc
+```
+
+## Building a quantitative predictor of sepsis risk
+Building a difussion map to order samples into the SRS continuum.
+```{r build_difussion_map, message=FALSE, warning=FALSE}
+set.seed(1)
+sepsis_diffusion_map <- DiffusionMap(reference_set_aligned, n_eigs=3)
+```
+
+Estimating a diffusion pseudotime variable
+```{r calcualte_pseudotime, message=FALSE, warning=FALSE}
+set.seed(1)
+sepsis_pseudotime <- DPT(sepsis_diffusion_map)
+```
+
+The first two diffusion components look as follows
+```{r visualise_diffusion_map, message=FALSE, warning=FALSE, echo=FALSE}
+dc_coords <- data.frame(DC1 = eigenvectors(sepsis_diffusion_map)[, 1],
+                        DC2 = eigenvectors(sepsis_diffusion_map)[, 2],
+                        DPT = max(sepsis_pseudotime$DPT1) - sepsis_pseudotime$DPT1,
+                        SRS = pc_coords_reference_set$SRS_unsup,
+                        Assay = pc_coords_reference_set$Assay)
+
+ggplot(dc_coords[is.na(dc_coords$SRS),], aes(x = DC1, y = DC2)) +
+  geom_point(color="lightgrey") +
+  geom_point(data=dc_coords[!is.na(dc_coords$SRS),], aes(x = DC1, y = DC2, colour = SRS, shape=Assay),
+             size=2) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue"), na.value="lightgrey") +
+  xlab("Diffusion component 1") + 
+  ylab("Diffusion component 2") +
+  theme_classic()
+
+ggplot(dc_coords, aes(x = DC1, y = DC2)) +
+  geom_point(aes(color=DPT)) +
+  xlab("Diffusion component 1") + 
+  ylab("Diffusion component 2") +
+  theme_classic()
+```
+
+This diffusion map separates samples by SRS group, gradually going from healthy to SRS2 and SRS1. Importantly, different gene expression measurement platforms seem to be aligned along diffusion pseudotime. Thus, we will use this variable to derive a sepsis startification score (SRSq). 
+
+We do so by re-scaling the diffusion pseudotime
+```{r define_SRSq, message=FALSE, warning=FALSE}
+pc_coords_reference_set$SRSq <- (dc_coords$DC1-min(dc_coords$DC1))/(max(dc_coords$DC1)-min(dc_coords$DC1))
+```
+
+The resulting risk socre looks as follows.
+```{r visualise_SRSq, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords_reference_set, aes(x=-PC1, y=PC2)) +
+  geom_point(aes(color=SRSq), size=3) +
+  theme_classic()
+```
+
+The resulting scores look as follows when stratified by technology and SRS group.
+```{r visualise_SRSq_boxplots, message=FALSE, warning=FALSE, echo=FALSE}
+pc_coords_reference_set$Study_assay <- paste(pc_coords_reference_set$Study, " (", pc_coords_reference_set$Assay, ")", sep="") 
+pc_coords_reference_set$Study_assay <- gsub("dutch","",gsub("RNAseq","RNA-seq",pc_coords_reference_set$Study_assay))
+pc_coords_reference_set$Study_assay <- factor(pc_coords_reference_set$Study_assay, 
+                                              levels=c("FINRISK (IlluminaHT)","SHIP-TREND (IlluminaHT)","Martin (Affymetrix)","500FG (RNA-seq)",
+                                                       "GAinS (IlluminaHT)", "GAinS (RNA-seq)")) 
+
+ggplot(pc_coords_reference_set, aes(x=Study_assay, y=SRSq)) +
+  geom_boxplot() +
+  geom_jitter(aes(color=SRS_model), width=0.15, alpha=0.2) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue"), na.value="lightgrey") +
+  ylab("SRSq (extended set)") +
+  coord_flip() +
+  stat_compare_means() +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+We add their corresponding risk score values to all samples in the training set.
+```{r define_transcriptional_scores, message=FALSE, warning=FALSE}
+training_set$SRSq <- pc_coords_reference_set[c(training_samples_microarray$SampleID,
+                                              training_samples_RNAseq$SampleID,
+                                              training_samples_dutch500FG$SampleID,
+                                              training_samples_ship_trend$SampleID,
+                                              training_samples_inouye$SampleID),]$SRSq
+```
+
+Training a generalized linear model to predict the transcriptional risk score of severe sepsis
+```{r define_SRSq_rf_parameters, eval=FALSE}
+ctrl <- trainControl(method = "LOOCV",
+                     savePredictions = T, 
+                     predictionBounds = c(0,1))
+```
+
+```{r train_rf_SRSq, eval=FALSE}
+set.seed(1)
+model_rf_SRSq <- train(SRSq~., data=training_set[,c(1:19,21)],
+                       method="rf", 
+                       metric="RMSE", 
+                       trControl=ctrl, 
+                       tuneGrid=grid_rf)
+```
+
+```{r load_rf_SRSq_model, message=FALSE, warning=FALSE, echo=FALSE}
+model_rf_SRSq <- readRDS("../results/classifier_models/SRSq-prediction-model_extended-19-gene-set_RF_trained-on-mNN-aligned-reference-set.rds")
+```
+
+The performance of this models in cross-validation is as follows:
+```{r model_rf_SRSq, message=FALSE, warning=FALSE, echo=FALSE}
+model_rf_SRSq
+```
+
+Exporting classifier model as an RDS object.
+```{r export_rf_SRSq_model, eval=FALSE}
+saveRDS(model_rf_SRSq, "../results/classifier_models/SRSq-prediction-model_extended-19-gene-set_RF_trained-on-mNN-aligned-reference-set.rds")
+```
+
+## Assessing performance of these models in the testing set
+Predicting labels in the entire reference set
+```{r predict_labels, message=FALSE, warning=FALSE}
+pc_coords_reference_set$SRS_rf <- predict(model_rf, reference_set_aligned, typ="raw")
+pc_coords_reference_set$SRSq_rf <- predict(model_rf_SRSq, reference_set_aligned, typ="raw")
+
+gains_microarray$SRS_rf_mnn <- pc_coords_reference_set$SRS_rf[pc_coords_reference_set$Study=="GAinS" & pc_coords_reference_set$Assay == "IlluminaHT"]
+gains_RNAseq$SRS_rf_mnn <- pc_coords_reference_set$SRS_rf[pc_coords_reference_set$Study=="GAinS" & pc_coords_reference_set$Assay == "RNAseq"]
+
+gains_microarray$SRSq <- pc_coords_reference_set$SRSq[pc_coords_reference_set$Study=="GAinS" & pc_coords_reference_set$Assay == "IlluminaHT"]
+gains_RNAseq$SRSq <- pc_coords_reference_set$SRSq[pc_coords_reference_set$Study=="GAinS" & pc_coords_reference_set$Assay == "RNAseq"]
+```
+
+When comparing the SRS predictions of the random forest model for testing samples with previous labels obtained in the group, we observe the following degree of agreement:
+```{r consufion_matrix_test_set, message=FALSE, warning=FALSE, echo=FALSE}
+confusionMatrix(data = pc_coords_reference_set$SRS_rf[!rownames(pc_coords_reference_set) %in% rownames(training_set)],
+                reference = factor(gsub("2","SRS2",gsub("1","SRS1",pc_coords_reference_set$SRS_model[!rownames(pc_coords_reference_set) %in% rownames(training_set)]))))
+```
+
+Furthermore, there is high agreement between classification based on different gene expression profiling technologies, as shown by the following Jaccard indexes between labels.
+```{r define_getJaccardIndex, message=FALSE, warning=FALSE}
+getJaccardIndex <- function(a,b){
+  if( length(union(a,b)) == 0 ){
+    jaccard_index = 0
+  } else{
+   jaccard_index = length(intersect(a,b))/length(union(a,b)) 
+  }
+  
+  return(jaccard_index)
+}
+```
+
+```{r plot_jaccard_indexes_by_technology_gains, message=FALSE, warning=FALSE, echo=FALSE}
+shared_samples_microarray <- intersect(colnames(gains_microarray), colnames(gains_RNAseq))
+jaccard_indexes_gains_microarray <- data.frame(
+  sapply(c("SRS1","SRS2"), FUN=function(i) {
+    sapply(c("SRS1","SRS2"), FUN=function(j){
+      getJaccardIndex(colnames(gains_microarray[,shared_samples_microarray])[gains_microarray[,shared_samples_microarray]$SRS_rf_mnn==i], 
+                      colnames(gains_RNAseq[,shared_samples_microarray])[gains_RNAseq[,shared_samples_microarray]$SRS_rf_mnn==j])
+      })
+    }),
+  row.names = c("SRS1 (RNA-seq)","SRS2 (RNA-seq)")
+  )
+colnames(jaccard_indexes_gains_microarray) <- paste(c("SRS1","SRS2"),"(Microarray)",sep=" ")
+
+
+pheatmap::pheatmap(t(jaccard_indexes_gains_microarray), cellheight=20, cellwidth=30,
+                   row.names = colnames(jaccard_indexes_gains_microarray))
+```
+
+This can also be visualised in the upset plot below
+```{r create_upset_plot, message=FALSE, warning=FALSE, echo=FALSE}
+all_samples <- unique(c(colnames(gains_microarray),colnames(gains_RNAseq)))
+upset(
+  fromList(
+    list(
+      "Microarray (SRS1)" = intersect(all_samples, colnames(gains_microarray)[gains_microarray$SRS_rf_mnn == "SRS1"]),
+      "RNA-seq (SRS1)" = intersect(all_samples, colnames(gains_RNAseq)[gains_RNAseq$SRS_rf_mnn == "SRS1"]),
+      
+      "Microarray (SRS2)" = intersect(all_samples, colnames(gains_microarray)[gains_microarray$SRS_rf_mnn == "SRS2"]),
+      "RNA-seq (SRS2)" = intersect(all_samples, colnames(gains_RNAseq)[gains_RNAseq$SRS_rf_mnn == "SRS2"]),
+      
+      "RNA-seq (SRS3)" = intersect(all_samples, colnames(gains_RNAseq)[gains_RNAseq$SRS_rf_mnn == "SRS3"])
+      )
+    ), 
+  order.by = "freq", 
+  nsets = 9
+)
+
+```
+
+In addition, the quantitative model also agrees well with difussion component 1 values in the testing set. 
+```{r correlations_with_archetypes_test_set, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords_reference_set, aes(x=SRSq, y=SRSq_rf)) +
+    geom_abline(slope = 1, intercept = 0, color="darkgrey") +
+  geom_point(aes(color=SRS_rf)) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_cor() +
+  xlab("Difussion map-derived SRSq") +
+  ylab("Predicted SRSq") +
+  theme_classic()
+```
+
+The performance metrics for this model are:
+```{r SRSq_rf_performance_in_test_set, message=FALSE, warning=FALSE}
+RMSE(pc_coords_reference_set$SRSq, pc_coords_reference_set$SRSq_rf)
+R2(pc_coords_reference_set$SRSq, pc_coords_reference_set$SRSq_rf)
+```
+
+## Differential expression analysis
+
+We now proceed to test if the classification model is successfully separating samples when into distinct groups when looking at their whole transcriptome, rather than just at the 7 genes used for classification. In order to ensure consistency between the analysis of RNA-seq and microarray data, we use limma to test for differential gene expression between SRS groups in both data sets.
+
+### Testing for differential gene expression between the SRS1 and SRS2 groups
+
+We begin by defining the design matrices.
+```{r define_limma_design_matrices, message=FALSE, warning=FALSE}
+# Microarray
+SRS_labels_microarray <- factor(gains_microarray$SRS_rf_mnn, levels = c("SRS1","SRS2"))
+design_matrix_microarray <- model.matrix( ~ 0 + SRS_labels_microarray)
+colnames(design_matrix_microarray) <-c("SRS1","SRS2")
+
+# RNA-seq
+SRS_labels_RNAseq <- factor(gains_RNAseq$SRS_rf_mnn, levels = c("SRS1","SRS2","SRS3"))
+design_matrix_RNAseq <- model.matrix( ~ 0 + SRS_labels_RNAseq)
+colnames(design_matrix_RNAseq) <-c("SRS1","SRS2","SRS3")
+```
+
+We can then test for differential gene expression between the SRS1 and SRS2 groups. To do so, we use limma to estimate variances and fits based on the design matrices defined above.
+```{r test_for_differential_expression, message=FALSE, warning=FALSE}
+# Microarray
+fit_microarray <- lmFit(assay(gains_microarray), design_matrix_microarray)
+contrast_matrix_microarray <- makeContrasts(SRS1-SRS2, levels=design_matrix_microarray)
+
+fit2_microarray <- contrasts.fit(fit_microarray, contrast_matrix_microarray)
+fit2_microarray <- eBayes(fit2_microarray)
+
+# RNA-seq
+fit_RNAseq <- lmFit(assay(gains_RNAseq), design_matrix_RNAseq)
+contrast_matrix_RNAseq <- makeContrasts(SRS1-SRS2, levels=design_matrix_RNAseq)
+
+fit2_RNAseq <- contrasts.fit(fit_RNAseq, contrast_matrix_RNAseq)
+fit2_RNAseq <- eBayes(fit2_RNAseq)
+```
+
+Next, we retrieve the relevant statistics for any differentially expressed genes from limma's fit objects. We define differentially expressed genes as any genes with an absolute fold change of at least 1.5 between both groups (roughly equivalent to an |LFC| > 0.6) at an FDR of 0.05.
+```{r extract_DE_genes, message=FALSE, warning=FALSE}
+# Microarray
+DEGs_microarray <- topTable(fit2_microarray, adjust="BH", number = nrow(gains_microarray))
+DEGs_microarray$gene_name <- rownames(DEGs_microarray)
+DEGs_microarray$gene_id <- rowData(gains_microarray)[DEGs_microarray$gene_name,]$Ensembl_ID
+DEGs_microarray$DE <- abs(DEGs_microarray$logFC) >= log2(1.5) & DEGs_microarray$adj.P.Val <= 0.05
+
+# RNA-seq
+DEGs_RNAseq <- topTable(fit2_RNAseq, adjust="BH", number = nrow(gains_RNAseq))
+DEGs_RNAseq$gene_id <- rownames(DEGs_RNAseq)
+DEGs_RNAseq$gene_name <- rowData(gains_RNAseq)[DEGs_RNAseq$gene_id,]$gene_name
+DEGs_RNAseq$DE <- abs(DEGs_RNAseq$logFC) >= log2(1.5) & DEGs_RNAseq$adj.P.Val <= 0.05
+```
+
+A simple volcano plot visualization reveals the top differentially expressed genes between SRS groups in both RNA-seq and microarray.
+```{r create_volcano_plot_top_genes, message=FALSE, warning=FALSE, echo=FALSE}
+top_genes_microarray <- c(rownames(DEGs_microarray[DEGs_microarray$DE==T & DEGs_microarray$logFC > 0,])[1:5],
+                          rownames(DEGs_microarray[DEGs_microarray$DE==T & DEGs_microarray$logFC < 0,])[1:5])
+top_genes_RNAseq <- c(rownames(DEGs_RNAseq[DEGs_RNAseq$DE==T & DEGs_RNAseq$logFC > 0,])[1:5],
+                      rownames(DEGs_RNAseq[DEGs_RNAseq$DE==T & DEGs_RNAseq$logFC < 0,])[1:5])
+
+# Microarray
+g1 <- ggplot(DEGs_microarray, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_microarray, aes(color=DE)) +
+  geom_label_repel(data=DEGs_microarray[top_genes_microarray,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRS1 vs SRS2\n", "(Microarray cohort)")) +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+
+# RNA-seq
+g2 <- ggplot(DEGs_RNAseq, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_RNAseq, aes(color=DE)) +
+  geom_label_repel(data=DEGs_RNAseq[top_genes_RNAseq,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRS1 vs SRS2\n", "(RNA-seq cohort)")) +
+  theme_classic() +
+  theme(legend.position="none", 
+        plot.title = element_text(hjust=0.5))
+
+plot_grid(g1,g2, ncol=2)
+```
+
+In addition, we assess where genes previously identified as differentially expressed between SRS groups by Davenport et al. fall in this distribution. All of these genes are located in the expected side of the volcano plot.
+```{r create_volcano_plot_genes_from_davenport_et_al, message=FALSE, warning=FALSE, echo=FALSE}
+top_genes_srs_paper <- c("SLC25A38","RSAD1","LY9","WDR74","ZNHIT6","TSEN54","ABHD14A","ANKS1A")
+
+# Microarray
+g1  <- ggplot(DEGs_microarray, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_microarray, aes(color=DE)) +
+  geom_label_repel(data=DEGs_microarray[rownames(DEGs_microarray) %in% top_genes_srs_paper,],
+             aes(label=gene_name, color=DE), size=3.5) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRS1 vs SRS2\n", "(Microarray cohort)")) +
+  theme_classic() +
+  theme(legend.position="none", 
+        plot.title = element_text(hjust=0.5))
+
+# RNA-seq
+g2 <- ggplot(DEGs_RNAseq, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_RNAseq, aes(color=DE)) +
+  geom_label_repel(data=DEGs_RNAseq[DEGs_RNAseq$gene_name %in% top_genes_srs_paper,],
+             aes(label=gene_name, color=DE), size=3.5) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRS1 vs SRS2\n", "(RNA-seq cohort)")) +
+  theme_classic() +
+  theme(legend.position="none", 
+        plot.title = element_text(hjust=0.5))
+
+plot_grid(g1,g2, ncol=2)
+```
+
+Further, some interesting example genes:
+```{r create_volcano_plot_example_genes, message=FALSE, warning=FALSE, echo=FALSE}
+example_genes <- c("EMR3","GZMK","CD27","GZMH","CCR3","HLA-DMB","HLAC","CD6","CD177","MMP8","HPGD","TDRD9","GPR84","TNFAIP8L3")
+
+# Microarray
+g1  <- ggplot(DEGs_microarray, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_microarray, aes(color=DE)) +
+  geom_label_repel(data=DEGs_microarray[rownames(DEGs_microarray) %in% example_genes,],
+             aes(label=gene_name, color=DE), size=3.5) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRS1 vs SRS2\n", "(Microarray cohort)")) +
+  theme_classic() +
+  theme(legend.position="none", 
+        plot.title = element_text(hjust=0.5))
+
+# RNA-seq
+g2 <- ggplot(DEGs_RNAseq, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_RNAseq, aes(color=DE)) +
+  geom_label_repel(data=DEGs_RNAseq[DEGs_RNAseq$gene_name %in% example_genes,],
+             aes(label=gene_name, color=DE), size=3.5) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRS1 vs SRS2\n", "(RNA-seq cohort)")) +
+  theme_classic() +
+  theme(legend.position="none", 
+        plot.title = element_text(hjust=0.5))
+
+plot_grid(g1,g2, ncol=2)
+```
+
+Let's now assess the correlation between gene log-fold changes estimated from microarray and RNA-seq data. We do so based on ~10,000 genes which are shared between both technologies.
+```{r find_shared_genes, message=FALSE, warning=FALSE}
+shared_genes <- intersect(DEGs_microarray$gene_name, DEGs_RNAseq$gene_name)
+
+RNAseq_res <- DEGs_RNAseq[DEGs_RNAseq$gene_name %in% shared_genes, ]
+RNAseq_res <- RNAseq_res[!duplicated(RNAseq_res$gene_name),]
+rownames(RNAseq_res) <- RNAseq_res$gene_name
+RNAseq_res <- RNAseq_res[shared_genes, ]
+
+microarray_res <- DEGs_microarray[shared_genes,]
+```
+
+The correlation looks as follows:
+```{r plot_LFC_correlation, message=FALSE, warning=FALSE, echo=FALSE}
+plot(microarray_res$logFC, RNAseq_res$logFC,
+     xlab="Microarray LFC",
+     ylab="RNA-seq LFC",
+     xlim=c(-2,3),
+     ylim=c(-2,3),
+     pch=19,
+     col="darkgrey",
+     main=paste("Correlation between microarray and RNA-seq\n \u03C1 = ", 
+                round(cor(microarray_res$logFC, RNAseq_res$logFC),2))
+     )
+abline(0,1, col="darkred")
+```
+
+Let's export these results as a text file for future reference.
+```{r export_DE_genes, eval=FALSE}
+# Microarray
+write.table(DEGs_microarray[order(-DEGs_microarray$logFC),], 
+            file = "../results/differential_gene_expression/GAinS/GAinS-microarray_DEGs_SRS1-vs-SRS2_limma_extended-signature.tsv",
+            quote = F, row.names = F, sep="\t")
+
+# RNA-seq
+write.table(DEGs_RNAseq[order(-DEGs_RNAseq$logFC),], 
+            file = "../results/differential_gene_expression/GAinS/GAinS-RNAseq_DEGs_SRS1-vs-SRS2_limma_extended-signature.tsv",
+            quote = F, row.names = F, sep="\t")
+
+```
+
+### Testing for differential gene expression along SRSq
+One of the advantages of defining a quantitative sepsis response score is that it can be used to increase our power to detect gene expression differences. To test whether this is the case, we will test for differential expression associated with the quantitative SRSq variable.
+
+Let's again define a set of suitable model matrices.
+```{r define_design_matrices_SRSq, message=FALSE, warning=FALSE}
+# Microarray
+design_matrix_microarray_SRSq <- model.matrix(~gains_microarray$SRSq)
+
+# RNA-seq
+design_matrix_RNAseq_SRSq <- model.matrix(~gains_RNAseq$SRSq)
+```
+
+We then test for an association between gene expression level and SRSq using limma.
+```{r test_for_differential_expression_SRSq, message=FALSE, warning=FALSE}
+# Microarray
+fit_microarray_SRSq <- lmFit(assay(gains_microarray), design_matrix_microarray_SRSq)
+fit2_microarray_SRSq <- contrasts.fit(fit_microarray_SRSq, coef = 2)
+fit2_microarray_SRSq <- eBayes(fit2_microarray_SRSq)
+
+# RNA-seq
+fit_RNAseq_SRSq <- lmFit(assay(gains_RNAseq), design_matrix_RNAseq_SRSq)
+fit2_RNAseq_SRSq <- contrasts.fit(fit_RNAseq_SRSq, coef = 2)
+fit2_RNAseq_SRSq <- eBayes(fit2_RNAseq_SRSq)
+```
+
+Finally, we retrieve the relevant statistics for any differentially expressed genes from limma's fit objects.We define differentially expressed genes as |fold change| >= 3.5 at an FDR <= 0.05. Because SRSq is bounded to the [0,1] range, a fold-change of 3.5 is approximately equivalent to a 1-fold increase in expression for every 0.3-unit increase in SRSq. 
+```{r extract_DE_genes_SRSq, message=FALSE, warning=FALSE}
+# Microarray
+DEGs_microarray_SRSq <- topTable(fit2_microarray_SRSq, adjust="BH", number = nrow(gains_microarray))
+DEGs_microarray_SRSq$gene_name <- rownames(DEGs_microarray_SRSq)
+DEGs_microarray_SRSq$gene_id <- rowData(gains_microarray)[DEGs_microarray_SRSq$gene_name,]$Ensembl_ID
+DEGs_microarray_SRSq$DE <- abs(DEGs_microarray_SRSq$logFC) >= log2(3.5) & DEGs_microarray_SRSq$adj.P.Val <= 0.05
+
+# RNA-seq
+DEGs_RNAseq_SRSq <- topTable(fit2_RNAseq_SRSq, adjust="BH", number = nrow(gains_RNAseq))
+DEGs_RNAseq_SRSq$gene_id <- rownames(DEGs_RNAseq_SRSq)
+DEGs_RNAseq_SRSq$gene_name <- rowData(gains_RNAseq)[DEGs_RNAseq_SRSq$gene_id,]$gene_name
+DEGs_RNAseq_SRSq$DE <- abs(DEGs_RNAseq_SRSq$logFC) >= log2(3.5) & DEGs_RNAseq_SRSq$adj.P.Val <= 0.05
+```
+
+The respective volcano plot looks as follows:
+```{r create_volcano_plot_SRSq, message=FALSE, warning=FALSE, echo=FALSE}
+top_genes_microarray_SRSq <- c(rownames(DEGs_microarray_SRSq[DEGs_microarray_SRSq$DE==T & DEGs_microarray_SRSq$logFC > 0,])[1:15],
+                          rownames(DEGs_microarray_SRSq[DEGs_microarray_SRSq$DE==T & DEGs_microarray_SRSq$logFC < 0,])[1:10])
+top_genes_RNAseq_SRSq <- c(rownames(DEGs_RNAseq_SRSq[DEGs_RNAseq_SRSq$DE==T & DEGs_RNAseq_SRSq$logFC > 0,])[1:15],
+                           rownames(DEGs_RNAseq_SRSq[DEGs_RNAseq_SRSq$DE==T & DEGs_RNAseq_SRSq$logFC < 0,])[1:10])
+
+# Microarray
+g1 <- ggplot(DEGs_microarray_SRSq, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_microarray, aes(color=DE)) +
+  geom_label_repel(data=DEGs_microarray[top_genes_microarray_SRSq,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRSq-associated genes\n", "(Microarray cohort)")) +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+
+# RNA-seq
+g2 <- ggplot(DEGs_RNAseq_SRSq, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_RNAseq, aes(color=DE)) +
+  geom_label_repel(data=DEGs_RNAseq[top_genes_RNAseq_SRSq,],
+             aes(label=gene_name, color=DE), size=3.5, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRSq-associated genes\n", "(RNA-seq cohort)")) +
+  theme_classic() +
+  theme(legend.position="none", 
+        plot.title = element_text(hjust=0.5))
+
+plot_grid(g1,g2, ncol=2)
+```
+
+Reassuringly, the estimated LFCs correlate extremely well between the SRS1 vs SRS2 comparison and when testing with SRSq directly.
+```{r plot_LFC_correlation_SRSq_vs_SRS, message=FALSE, warning=FALSE, echo=FALSE}
+plot(DEGs_microarray$logFC,
+     DEGs_microarray_SRSq[rownames(DEGs_microarray),]$logFC,
+     xlab="LFC (SRS1 vs SRS2)",
+     ylab="LFC (SRSq)",
+     main=paste(
+       "Microarray cohort\n",
+       "\u03C1 =", round(cor(DEGs_microarray$logFC,DEGs_microarray_SRSq[rownames(DEGs_microarray),]$logFC),3)
+       ),
+     pch=19,
+     col="darkgrey")
+
+plot(DEGs_RNAseq$logFC,
+     DEGs_RNAseq_SRSq[rownames(DEGs_RNAseq),]$logFC,
+      xlab="LFC (SRS1 vs SRS2)",
+     ylab="LFC (SRSq)",
+     main=paste(
+       "RNA-seq cohort\n",
+       "\u03C1 =", round(cor(DEGs_RNAseq$logFC,DEGs_RNAseq_SRSq[rownames(DEGs_RNAseq),]$logFC),3)
+       ),
+     pch=19,
+     col="darkgrey")
+```
+
+However, a comparison of the number of genes detected as differentially expressed by both methods reveal a large difference in power, and supports the added value of modeling patient heterogeneity as a continuum.
+```{r create_upset_plot_SRS_vs_SRSq_DEGs, message=FALSE, warning=FALSE, echo=FALSE}
+upset(
+  fromList(
+    list(
+      "SRS1 vs SRS2 (Microarray)" = na.omit(DEGs_microarray$gene_id[DEGs_microarray$DE]),
+      "SRSq (Microarray)" = na.omit(DEGs_microarray_SRSq$gene_id[DEGs_microarray_SRSq$DE]),
+      "SRS1 vs SRS2 (RNA-seq)" = na.omit(DEGs_RNAseq$gene_id[DEGs_RNAseq$DE]),
+      "SRSq (RNA-seq)" = na.omit(DEGs_RNAseq_SRSq$gene_id[DEGs_RNAseq_SRSq$DE])
+      )
+    ), 
+  order.by = "freq"
+)
+```
+
+
+Furthermore, a closer look at the top SRSq-associated genes reveals that they increase proportionally to SRSq, with a pattern of gradual upregulation.
+
+This is true both in the microarray cohort:
+```{r plot_gex_vs_SRSq_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+par(mfrow=c(2,3))
+for(i in c(1:3,16:18)){
+  print(
+    plot(gains_microarray$SRSq,
+     assay(gains_microarray[top_genes_microarray_SRSq[i],]),
+     col = gains_microarray$SRS_rf_mnn,
+     main=top_genes_microarray_SRSq[i],
+     xlab="SRSq",
+     ylab="Log-VSN expression",
+     pch=19)
+  )
+}
+```
+
+And in the RNA-seq cohort:
+```{r plot_gex_vs_SRSq_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+par(mfrow=c(2,3))
+for(i in c(1:3,16:18)){
+  print(
+    plot(gains_RNAseq$SRSq,
+     assay(gains_RNAseq[top_genes_RNAseq_SRSq[i],]),
+     col = gains_RNAseq$SRS_rf_mnn,
+     main=rowData(gains_RNAseq)[top_genes_RNAseq_SRSq[i],]$gene_name,
+     xlab="SRSq",
+     ylab="Gene expression (log-cpm)",
+     pch=19)
+  )
+}
+```
+
+Let's also export these results for future reference.
+```{r export_DE_genes_SRSq, eval=FALSE}
+# Microarray
+write.table(DEGs_microarray_SRSq[order(-DEGs_microarray_SRSq$logFC),], 
+            file = "../results/differential_gene_expression/GAinS/GAinS-microarray_DEGs_SRSq_limma_extended-signature.tsv",
+            quote = F, row.names = F, sep="\t")
+
+# RNA-seq
+write.table(DEGs_RNAseq_SRSq[order(-DEGs_RNAseq_SRSq$logFC),], 
+            file = "../results/differential_gene_expression/GAinS/GAinS-RNAseq_DEGs_SRSq_limma_extended-signature.tsv",
+            quote = F, row.names = F, sep="\t")
+```
+
+
+### Pathway enrichment analysis
+Next, let's assess whether genes associated with SRS1 or SRS2 are enriched in any relevant biological pathways. We use the XGR method to test for enrichment in REACTOME pathways.
+```{r run_XGR, eval=FALSE}
+## Upregulated genes
+# Microarray
+XGR_up_microarray <- xEnricherGenes(data=DEGs_microarray$gene_name[DEGs_microarray$DE & DEGs_microarray$logFC > 0], 
+                                       background = DEGs_microarray$gene_name,
+                                       ontology="	MsigdbC2REACTOME")
+
+XGR_up_microarray_SRSq <- xEnricherGenes(data=DEGs_microarray_SRSq$gene_name[DEGs_microarray_SRSq$DE & DEGs_microarray_SRSq$logFC > 0], 
+                                            background = DEGs_microarray_SRSq$gene_name,
+                                            ontology="MsigdbC2REACTOME")
+
+# RNA-seq
+XGR_up_RNAseq <- xEnricherGenes(data=DEGs_RNAseq$gene_name[DEGs_RNAseq$DE & DEGs_RNAseq$logFC > 0], 
+                                       background = DEGs_RNAseq$gene_name,
+                                       ontology="MsigdbC2REACTOME")
+
+XGR_up_RNAseq_SRSq <- xEnricherGenes(data=DEGs_RNAseq_SRSq$gene_name[DEGs_RNAseq_SRSq$DE & DEGs_RNAseq_SRSq$logFC > 0], 
+                                        background = DEGs_RNAseq_SRSq$gene_name,
+                                        ontology="MsigdbC2REACTOME")
+
+## Downregulated genes
+# Microarray
+XGR_down_microarray <- xEnricherGenes(data=DEGs_microarray$gene_name[DEGs_microarray$DE & DEGs_microarray$logFC < 0], 
+                                       background = DEGs_microarray$gene_name,
+                                       ontology="MsigdbC2REACTOME")
+
+XGR_down_microarray_SRSq <- xEnricherGenes(data=DEGs_microarray_SRSq$gene_name[DEGs_microarray_SRSq$DE & DEGs_microarray_SRSq$logFC < 0], 
+                                            background = DEGs_microarray_SRSq$gene_name,
+                                            ontology="MsigdbC2REACTOME")
+
+# RNA-seq
+XGR_down_RNAseq <- xEnricherGenes(data=DEGs_RNAseq$gene_name[DEGs_RNAseq$DE & DEGs_RNAseq$logFC < 0], 
+                                       background = DEGs_RNAseq$gene_name,
+                                       ontology="MsigdbC2REACTOME")
+
+XGR_down_RNAseq_SRSq <- xEnricherGenes(data=DEGs_RNAseq_SRSq$gene_name[DEGs_RNAseq_SRSq$DE & DEGs_RNAseq_SRSq$logFC < 0], 
+                                        background = DEGs_RNAseq_SRSq$gene_name,
+                                        ontology="MsigdbC2REACTOME")
+```
+
+```{r load_XGR_results, warning=FALSE, message=FALSE, echo=FALSE}
+load("../results/differential_gene_expression/GAinS/XGR-results-GAinS_extended-signature.rdata")
+```
+
+We then subset these results to include only significantly-enriched biological terms.
+```{r format_XGR_results, warning=FALSE, message=FALSE}
+## Reformatting results table
+XGR_up_microarray <- xEnrichViewer(XGR_up_microarray, top_num=length(XGR_up_microarray$adjp), sortBy="fc", details=TRUE)
+XGR_up_microarray_SRSq <- xEnrichViewer(XGR_up_microarray_SRSq, top_num=length(XGR_up_microarray_SRSq$adjp), sortBy="fc", details=TRUE)
+
+XGR_up_RNAseq <- xEnrichViewer(XGR_up_RNAseq, top_num=length(XGR_up_RNAseq$adjp), sortBy="fc", details=TRUE)
+XGR_up_RNAseq_SRSq <- xEnrichViewer(XGR_up_RNAseq_SRSq, top_num=length(XGR_up_RNAseq_SRSq$adjp), sortBy="fc", details=TRUE)
+
+XGR_down_microarray <- xEnrichViewer(XGR_down_microarray, top_num=length(XGR_down_microarray$adjp), sortBy="fc", details=TRUE)
+XGR_down_microarray_SRSq <- xEnrichViewer(XGR_down_microarray_SRSq, top_num=length(XGR_down_microarray_SRSq$adjp), sortBy="fc", details=TRUE)
+
+XGR_down_RNAseq <- xEnrichViewer(XGR_down_RNAseq, top_num=length(XGR_down_RNAseq$adjp), sortBy="fc", details=TRUE)
+XGR_down_RNAseq_SRSq <- xEnrichViewer(XGR_down_RNAseq_SRSq, top_num=length(XGR_down_RNAseq_SRSq$adjp), sortBy="fc", details=TRUE)
+
+## Keeping only significantly enriched pathways
+XGR_up_microarray <- XGR_up_microarray[XGR_up_microarray$adjp <= 0.05,]
+XGR_up_microarray_SRSq <- XGR_up_microarray_SRSq[XGR_up_microarray_SRSq$adjp <= 0.05,]
+
+XGR_down_microarray <- XGR_down_microarray[XGR_down_microarray$adjp <= 0.05,]
+XGR_down_microarray_SRSq <- XGR_down_microarray_SRSq[XGR_down_microarray_SRSq$adjp <= 0.05,]
+
+
+XGR_up_RNAseq <-  XGR_up_RNAseq[XGR_up_RNAseq$adjp <= 0.05,]
+XGR_up_RNAseq_SRSq <- XGR_up_RNAseq_SRSq[XGR_up_RNAseq_SRSq$adjp <= 0.05,]
+
+XGR_down_RNAseq <- XGR_down_RNAseq[XGR_down_RNAseq$adjp <= 0.05,]
+XGR_down_RNAseq_SRSq <- XGR_down_RNAseq_SRSq[XGR_down_RNAseq_SRSq$adjp <= 0.05,]
+```
+
+In order to simplify the full output, we will for now focus exclusively on immune-relevant pathways. We define a bank of common immune terms.
+```{r define_immune_terms, message=FALSE, warning=FALSE}
+immune_terms <- c("NOTCH","TLR","Interleukin","NFk","MHC","(m|M)etabolism","Immun","ZAP-70","PD(-)?1","TCR","BCR","CD28","mTORC","SMAD","IFN","TGF","TRAF","Inflam","IRF","CTLA(-)?4","CD3","Interferon","Inflamm","(G|g)lyco")
+```
+
+When assessing differential pathway enrichment between SRS1 and SRS2, the results look as follows:
+```{r plot_SRS_associated_pathways, message=FALSE, warning=FALSE, echo=FALSE}
+XGR_up_microarray$name <- factor(XGR_up_microarray$name, levels=rev(XGR_up_microarray$name[order(-XGR_up_microarray$or)]))
+ggplot(XGR_up_microarray[grepl(paste(immune_terms, collapse="|"), XGR_up_microarray$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkred") +
+  geom_hline(yintercept = log2(1), color="darkred", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("Microarray cohort") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+
+XGR_down_microarray$name <- factor(XGR_down_microarray$name, levels=rev(XGR_down_microarray$name[order(-XGR_down_microarray$or)]))
+ggplot(XGR_down_microarray[grepl(paste(immune_terms, collapse="|"), XGR_down_microarray$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkblue") +
+  geom_hline(yintercept = log2(1), color="darkblue", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("Microarray cohort") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+
+XGR_up_RNAseq$name <- factor(XGR_up_RNAseq$name, levels=rev(XGR_up_RNAseq$name[order(-XGR_up_RNAseq$or)]))
+ggplot(XGR_up_RNAseq[grepl(paste(immune_terms, collapse="|"), XGR_up_RNAseq$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkred") +
+  geom_hline(yintercept = log2(1), color="darkred", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("RNA-seq cohort") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+
+XGR_down_RNAseq$name <- factor(XGR_down_RNAseq$name, levels=rev(XGR_down_RNAseq$name[order(-XGR_down_RNAseq$or)]))
+ggplot(XGR_down_RNAseq[grepl(paste(immune_terms, collapse="|"), XGR_down_RNAseq$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkblue") +
+  geom_hline(yintercept = log2(1), color="darkblue", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("RNA-seq cohort") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+```
+
+When assessing pathway enrichment in genes possitively or negatively associated with SRSq, the results look as follows:
+```{r plot_SRSq_associated_pathways, message=FALSE, warning=FALSE, echo=FALSE}
+XGR_up_microarray_SRSq$name <- factor(XGR_up_microarray_SRSq$name,
+                                      levels=rev(XGR_up_microarray_SRSq$name[order(-XGR_up_microarray_SRSq$or)]))
+ggplot(XGR_up_microarray_SRSq[grepl(paste(immune_terms, collapse="|"), XGR_up_microarray_SRSq$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkred") +
+  geom_hline(yintercept = log2(1), color="darkred", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("Microarray cohort") +
+  theme_classic() +
+  theme(axis.title.y = element_blank())
+
+XGR_down_microarray_SRSq$name <- factor(XGR_down_microarray_SRSq$name,
+                                        levels=rev(XGR_down_microarray_SRSq$name[order(-XGR_down_microarray_SRSq$or)]))
+ggplot(XGR_down_microarray_SRSq[grepl(paste(immune_terms, collapse="|"), XGR_down_microarray_SRSq$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkblue") +
+  geom_hline(yintercept = log2(1), color="darkblue", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("Microarray cohort") +
+  theme_classic() +
+  theme(axis.title.y = element_blank())
+
+XGR_up_RNAseq_SRSq$name <- factor(XGR_up_RNAseq_SRSq$name, 
+                                  levels=rev(XGR_up_RNAseq_SRSq$name[order(-XGR_up_RNAseq_SRSq$or)]))
+ggplot(XGR_up_RNAseq_SRSq[grepl(paste(immune_terms, collapse="|"), XGR_up_RNAseq_SRSq$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkred") +
+  geom_hline(yintercept = log2(1), color="darkred", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("RNA-seq cohort") +
+  theme_classic() +
+  theme(axis.title.y = element_blank())
+
+XGR_down_RNAseq_SRSq$name <- factor(XGR_down_RNAseq_SRSq$name,
+                                    levels=rev(XGR_down_RNAseq_SRSq$name[order(-XGR_down_RNAseq_SRSq$or)]))
+ggplot(XGR_down_RNAseq_SRSq[grepl(paste(immune_terms, collapse="|"), XGR_down_RNAseq_SRSq$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkblue") +
+  geom_hline(yintercept = log2(1), color="darkblue", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("RNA-seq cohort") +
+  theme_classic() +
+  theme(axis.title.y = element_blank())
+```
+
+## Assessing correlation between transcriptionally-defined sepsis response groups and clinical outcomes
+Importing clinical outcome data for the GAinS cohort.
+```{r import_outcome_data_gains, message=FALSE, warning=FALSE}
+gains_outdat <- read.csv("../data/gains_clinical_data/outDat08062021.csv")
+gains_demodat <- read.csv("../data/gains_clinical_data/demoDat08062021.csv")
+gains_inf <- read.csv("../data/gains_clinical_data/gains_additionalInfections_clean.csv")
+
+gains_clindat <- read.csv("../data/gains_clinical_data/clinDat08062021_2.csv")
+```
+
+```{r merege_outcome_and_demographic_data_gains, message=FALSE, warning=FALSE}
+gains_outdat <- cbind(gains_outdat, 
+                      gains_demodat[,setdiff(colnames(gains_demodat), colnames(gains_outdat))],
+                      gains_inf[,setdiff(colnames(gains_inf), colnames(gains_outdat))])
+```
+
+Fetching SRS prediction for latest available time point sampled for each patient.
+```{r add_SRS_predictions_to_outcome_data_gains, message=FALSE, warning=FALSE}
+# Defining variables to fetch
+srs_microarray_first <- c()
+srsq_microarray_first <- c()
+srs_RNAseq_first <- c()
+srsq_RNAseq_first <- c()
+sofa_first <- c()
+sofa_bili_first <- c()
+sofa_creat_first <- c()
+sofa_cardio_first <- c()
+sofa_GCS_first <- c()
+sofa_pao2_first <- c()
+sofa_plat_first <- c()
+pf_ratio_first <- c()
+map_lowest_first <- c()
+map_highest_first <- c()
+bilirubin_highest_first <- c()
+creatinine_highest_first <- c()
+platelets_first <- c()
+apache <- c()
+
+srs_microarray_last <- c()
+srsq_microarray_last <- c()
+srsq_microarray_peak <- c()
+srs_RNAseq_last <- c()
+srsq_RNAseq_last <- c()
+srsq_RNAseq_peak <- c()
+sofa_last <- c()
+sofa_bili_last <- c()
+sofa_creat_last <- c()
+sofa_cardio_last <- c()
+sofa_GCS_last <- c()
+sofa_pao2_last <- c()
+sofa_plat_last <- c()
+pf_ratio_last <- c()
+map_lowest_last <- c()
+map_highest_last <- c()
+bilirubin_highest_last <- c()
+creatinine_highest_last <- c()
+platelets_last <- c()
+
+# Fetching SRS predictions
+for(patient_id in gains_outdat$SubjectBarCode) {
+  
+  # Fetching microarray predictions at the last time point available per patient
+  dat_microarray <- colData(gains_microarray)[gains_microarray$GAinSID == patient_id,]
+  if(nrow(dat_microarray) == 0) {
+    SRS_microarray_first <- NA
+    SRSq_microarray_first <- NA
+    
+    SRS_microarray_last <- NA
+    SRSq_microarray_last <- NA
+    
+    SRSq_microarray_peak <- NA
+    
+    } else{
+      dat_microarray <- dat_microarray[order(dat_microarray$Day, decreasing = F),]
+      SRS_microarray_first <- as.character(dat_microarray$SRS_rf_mnn[1])
+      SRSq_microarray_first <- dat_microarray$SRSq[1]
+      
+      dat_microarray <- dat_microarray[order(dat_microarray$Day, decreasing = T),]
+      SRS_microarray_last <- as.character(dat_microarray$SRS_rf_mnn[1])
+      SRSq_microarray_last <- dat_microarray$SRSq[1]
+      
+      SRSq_microarray_peak <- max(dat_microarray$SRSq)
+    }
+      
+    # Fetching RNA-seq predictions at the last time point available per patient
+      dat_RNAseq <- colData(gains_RNAseq)[gains_RNAseq$GAinSID == patient_id,]
+      if(nrow(dat_RNAseq) == 0){
+        SRS_RNAseq_first <- NA
+        SRSq_RNAseq_first <- NA
+        
+        SRS_RNAseq_last <- NA
+        SRSq_RNAseq_last <- NA
+        
+        SRSq_RNAseq_peak <- NA
+        
+      } else{
+        dat_RNAseq <- dat_RNAseq[order(dat_RNAseq$Day, decreasing = F),]
+        SRS_RNAseq_first <- as.character(dat_RNAseq$SRS_rf_mnn[1])
+        SRSq_RNAseq_first <- dat_RNAseq$SRSq[1]
+        
+        dat_RNAseq <- dat_RNAseq[order(dat_RNAseq$Day, decreasing = T),]
+        SRS_RNAseq_last <- as.character(dat_RNAseq$SRS_rf_mnn[1])
+        SRSq_RNAseq_last <- dat_RNAseq$SRSq[1]
+        
+        SRSq_RNAseq_peak <- max(dat_RNAseq$SRSq)
+        
+      }
+      
+      # Fetching clinical variables
+      clindat <- gains_clindat[gains_clindat$SubjectBarCode == patient_id,]
+      if(nrow(clindat) == 0){
+        SOFA_first <- NA
+        SOFA_bili_first <- NA
+        SOFA_creat_first <- NA
+        SOFA_cardio_first <- NA
+        SOFA_GCS_first <- NA
+        SOFA_pao2_first <- NA
+        SOFA_plat_first <- NA
+        PF_ratio_first <- NA
+        MAP_lowest_first <- NA
+        MAP_highest_first <- NA
+        Bilirubin_highest_first <- NA
+        Creatinine_highest_first <- NA
+        Platelets_first <- NA
+        
+        SOFA_last <- NA
+        SOFA_bili_last <- NA
+        SOFA_creat_last <- NA
+        SOFA_cardio_last <- NA
+        SOFA_GCS_last <- NA
+        SOFA_pao2_last <- NA
+        SOFA_plat_last <- NA
+        PF_ratio_last <- NA
+        MAP_lowest_last <- NA
+        MAP_highest_last <- NA
+        Bilirubin_highest_last <- NA
+        Creatinine_highest_last <- NA
+        Platelets_last <- NA
+      } else{
+        
+        # Fetching variables at admission (i.e. Day 1)
+        clindat <- clindat[order(clindat$StudyEventId, decreasing = F),]
+        
+        APACHE <- clindat$TotalApache[1]
+        SOFA_first <- as.numeric(clindat$TotalSOFA[1])
+        SOFA_bili_first <- as.numeric(clindat$sofa_bilirubinScCorr[1])
+        SOFA_creat_first <- as.numeric(clindat$sofacreat[1])
+        SOFA_cardio_first <- as.numeric(clindat$sofaCardioScCorr[1])
+        SOFA_GCS_first <- as.numeric(clindat$sofa_GCSScCorr[1])
+        SOFA_pao2_first <- as.numeric(clindat$sofa_paO2ScCorr[1])
+        SOFA_plat_first <- as.numeric(clindat$sofa_platScCorr[1])
+        PF_ratio_first <- as.numeric(clindat$ratio[1])
+        MAP_lowest_first <- as.numeric(clindat$LMAP[1])
+        MAP_highest_first <- as.numeric(clindat$Hmap[1])
+        Bilirubin_highest_first <- as.numeric(clindat$HigBili[1])
+        Creatinine_highest_first <- as.numeric(clindat$Hcreat[1])
+        Platelets_first <- as.numeric(clindat$lplatelets[1])
+        
+        # Fetching variables at the last time point available per patient  
+        clindat <- clindat[order(clindat$StudyEventId, decreasing = T),]
+        
+        SOFA_last <- as.numeric(clindat$TotalSOFA[1])
+        SOFA_bili_last <- as.numeric(clindat$sofa_bilirubinScCorr[1])
+        SOFA_creat_last <- as.numeric(clindat$sofacreat[1])
+        SOFA_cardio_last <- as.numeric(clindat$sofaCardioScCorr[1])
+        SOFA_GCS_last <- as.numeric(clindat$sofa_GCSScCorr[1])
+        SOFA_pao2_last <- as.numeric(clindat$sofa_paO2ScCorr[1])
+        SOFA_plat_last <- as.numeric(clindat$sofa_platScCorr[1])
+        PF_ratio_last <- as.numeric(clindat$ratio[1])
+        MAP_lowest_last <- as.numeric(clindat$LMAP[1])
+        MAP_highest_last <- as.numeric(clindat$Hmap[1])
+        Bilirubin_highest_last <- as.numeric(clindat$HigBili[1])
+        Creatinine_highest_last <- as.numeric(clindat$Hcreat[1])
+        Platelets_last <- as.numeric(clindat$lplatelets[1])
+      }
+      
+      # Appending measurements to vector
+      srs_microarray_first <- c(srs_microarray_first, SRS_microarray_first)
+      srsq_microarray_first <- c(srsq_microarray_first, SRSq_microarray_first)
+      srs_RNAseq_first <- c(srs_RNAseq_first, SRS_RNAseq_first)
+      srsq_RNAseq_first <- c(srsq_RNAseq_first, SRSq_RNAseq_first)
+      sofa_first <- c(sofa_first, SOFA_first)
+      sofa_bili_first <- c(sofa_bili_first, SOFA_bili_first)
+      sofa_creat_first <- c(sofa_creat_first, SOFA_creat_first)
+      sofa_cardio_first <- c(sofa_cardio_first, SOFA_cardio_first)
+      sofa_GCS_first <- c(sofa_GCS_first, SOFA_GCS_first)
+      sofa_pao2_first <- c(sofa_pao2_first, SOFA_pao2_first)
+      sofa_plat_first <- c(sofa_plat_first, SOFA_plat_first)
+      pf_ratio_first <- c(pf_ratio_first, PF_ratio_first)
+      map_lowest_first <- c(map_lowest_first, MAP_lowest_first)
+      map_highest_first <- c(map_highest_first, MAP_highest_first)
+      bilirubin_highest_first <- c(bilirubin_highest_first, Bilirubin_highest_first)
+      creatinine_highest_first <- c(creatinine_highest_first, Creatinine_highest_first)
+      platelets_first <- c(platelets_first, Platelets_first)
+      apache <- c(apache, APACHE)
+      
+      srs_microarray_last <- c(srs_microarray_last, SRS_microarray_last)
+      srsq_microarray_last <- c(srsq_microarray_last, SRSq_microarray_last)
+      srsq_microarray_peak <- c(srsq_microarray_peak, SRSq_microarray_peak)
+      srs_RNAseq_last <- c(srs_RNAseq_last, SRS_RNAseq_last)
+      srsq_RNAseq_last <- c(srsq_RNAseq_last, SRSq_RNAseq_last)
+      srsq_RNAseq_peak <- c(srsq_RNAseq_peak, SRSq_RNAseq_peak)
+      sofa_last <- c(sofa_last, SOFA_last)
+      sofa_bili_last <- c(sofa_bili_last, SOFA_bili_last)
+      sofa_creat_last <- c(sofa_creat_last, SOFA_creat_last)
+      sofa_cardio_last <- c(sofa_cardio_last, SOFA_cardio_last)
+      sofa_GCS_last <- c(sofa_GCS_last, SOFA_GCS_last)
+      sofa_pao2_last <- c(sofa_pao2_last, SOFA_pao2_last)
+      sofa_plat_last <- c(sofa_plat_last, SOFA_plat_last)
+      pf_ratio_last <- c(pf_ratio_last, PF_ratio_last)
+      map_lowest_last <- c(map_lowest_last, MAP_lowest_last)
+      map_highest_last <- c(map_highest_last, MAP_highest_last)
+      bilirubin_highest_last <- c(bilirubin_highest_last, Bilirubin_highest_last)
+      creatinine_highest_last <- c(creatinine_highest_last, Creatinine_highest_last)
+      platelets_last <- c(platelets_last, Platelets_last)
+
+}
+```
+
+We make sure to set all the relevant variables as factor and numeric types. Moreover, we create a variable encodes age as decade of life. 
+```{r set_variable_types_gains_outdat, message=FALSE, warning=FALSE}
+gains_outdat$SRS_microarray_first <- factor(srs_microarray_first, levels=c("SRS2","SRS1"))
+gains_outdat$SRS_microarray_last <- factor(srs_microarray_last, levels=c("SRS2","SRS1"))
+gains_outdat$SRS_RNAseq_first <- factor(srs_RNAseq_first, levels=c("SRS3","SRS2","SRS1"))
+gains_outdat$SRS_RNAseq_last <- factor(srs_RNAseq_last, levels=c("SRS3","SRS2","SRS1"))
+gains_outdat$SRSq_microarray_first <- round(srsq_microarray_first,3)
+gains_outdat$SRSq_microarray_last <- round(srsq_microarray_last,3)
+gains_outdat$SRSq_microarray_peak <- round(srsq_microarray_peak,3)
+gains_outdat$SRSq_RNAseq_first <- round(srsq_RNAseq_first,3)
+gains_outdat$SRSq_RNAseq_last <- round(srsq_RNAseq_last,3)
+gains_outdat$SRSq_RNAseq_peak <- round(srsq_RNAseq_peak,3)
+
+gains_outdat$APACHE <- apache
+gains_outdat$SOFA_first <- sofa_first
+gains_outdat$SOFA_bili_first <- sofa_bili_first
+gains_outdat$SOFA_creat_first <- sofa_creat_first
+gains_outdat$SOFA_cardio_first <- sofa_cardio_first
+gains_outdat$SOFA_GCS_first <- sofa_GCS_first
+gains_outdat$SOFA_pao2_first <- sofa_pao2_first
+gains_outdat$SOFA_plat_first <- sofa_plat_first
+gains_outdat$SOFA_last <- sofa_last
+gains_outdat$SOFA_bili_last <- sofa_bili_last
+gains_outdat$SOFA_creat_last <- sofa_creat_last
+gains_outdat$SOFA_cardio_last <- sofa_cardio_last
+gains_outdat$SOFA_GCS_last <- sofa_GCS_last
+gains_outdat$SOFA_pao2_last <- sofa_pao2_last
+gains_outdat$SOFA_plat_last <- sofa_plat_last
+gains_outdat$PF_ratio_first <- pf_ratio_first
+gains_outdat$PF_ratio_last <- pf_ratio_last
+gains_outdat$MAP_lowest_first <- map_lowest_first
+gains_outdat$MAP_lowest_last <- map_lowest_last
+gains_outdat$MAP_highest_first <- map_highest_first
+gains_outdat$MAP_highest_last <- map_highest_last
+gains_outdat$Bilirubin_highest_first <- bilirubin_highest_first
+gains_outdat$Bilirubin_highest_last <- bilirubin_highest_last
+gains_outdat$Creatinine_highest_first <- creatinine_highest_first
+gains_outdat$Creatinine_highest_last <- creatinine_highest_last
+gains_outdat$Platelets_lowest_first <- platelets_first
+gains_outdat$Platelets_lowest_last <- platelets_last
+
+gains_outdat$diagnosis <- factor(gsub(2,"FP",gsub(1,"CAP",gains_outdat$diagnosis)), levels=c("FP","CAP"))
+gains_outdat$sex <- factor(gsub(2,"F",gsub(1,"M",gains_outdat$sex)), levels=c("F","M"))
+
+gains_outdat$age_bin <- ceiling(gains_outdat$nagec/10)
+
+gains_outdat$OICUInf <- as.factor(gsub(2,0,gains_outdat$OICUInf))
+```
+
+```{r print_gains_outdat, message=FALSE, warning=FALSE}
+head(gains_outdat)
+```
+
+```{r export_formatted_clinical_data, eval=FALSE}
+write.table(gains_outdat, "../data/gains_clinical_data/gains_clinical_and_outcome_data.tsv", sep="\t", row.names = F)
+```
+
+### Severity of illness
+The association between SRS groups and sequential organ failure (SOFA) scores is as follows:
+```{r plot_SRS_vs_SOFA, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_microarray_first),], aes(x=SRS_microarray_first, y=SOFA_first)) +
+  geom_boxplot(na.rm = T) +
+  geom_jitter(width=0.1, na.rm = T, color="darkgrey") +
+  stat_compare_means(method = "t.test", comparisons = list(c("SRS1", "SRS2"))) +
+  ggtitle("Microarray cohort") +
+  xlab("SRS group") +
+  ylab("Total SOFA score") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+g2 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_RNAseq_first),], aes(x=SRS_RNAseq_first, y=SOFA_first)) +
+  geom_boxplot(na.rm = T) +
+  geom_jitter(width=0.1, na.rm = T, color="darkgrey") +
+  stat_compare_means(method = "t.test", 
+                     comparisons = list(c("SRS1", "SRS2"), 
+                                        c("SRS2","SRS3"),
+                                        c("SRS1","SRS3"))) +
+  ggtitle("RNA-seq cohort") +
+  xlab("SRS group") +
+  ylab("Total SOFA score") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot_grid(g1,g2, ncol=2, nrow=1)
+
+
+g1 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_microarray_last),], aes(x=SRS_microarray_last, y=SOFA_last)) +
+  geom_boxplot(na.rm = T) +
+  geom_jitter(width=0.1, na.rm = T, color="darkgrey") +
+  stat_compare_means(method = "t.test", comparisons = list(c("SRS1", "SRS2"))) +
+  ggtitle("Microarray cohort") +
+  xlab("SRS group") +
+  ylab("Total SOFA score") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+g2 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_RNAseq_last),], aes(x=SRS_RNAseq_last, y=SOFA_last)) +
+  geom_boxplot(na.rm = T) +
+  geom_jitter(width=0.1, na.rm = T, color="darkgrey") +
+  stat_compare_means(method = "t.test", 
+                     comparisons = list(c("SRS1", "SRS2"), 
+                                        c("SRS2","SRS3"),
+                                        c("SRS1","SRS3"))) +
+  ggtitle("RNA-seq cohort") +
+  xlab("SRS group") +
+  ylab("Total SOFA score") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot_grid(g1,g2, ncol=2, nrow=1)
+```
+
+The same association is as follows for SRSq scores:
+```{r plot_SRSq_vs_SOFA, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(gains_outdat, aes(x=SRSq_microarray_first, y=SOFA_first)) +
+  geom_smooth(na.rm = T, method = "lm") +
+  geom_point(aes(color=SRS_microarray_first), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkred","steelblue")) +
+  ggtitle("Microarray cohort") +
+  xlab("SRSq") +
+  ylab("Total SOFA score") +
+  stat_cor() +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+
+g2 <- ggplot(gains_outdat, aes(x=SRSq_RNAseq_first, y=SOFA_first)) +
+  geom_smooth(na.rm = T, method = "lm") +
+  geom_point(aes(color=SRS_RNAseq_first), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkblue","steelblue","darkred")) +
+  ggtitle("RNA-seq cohort") +
+  xlab("SRSq") +
+  ylab("Total SOFA score") +
+  theme_classic() +
+  stat_cor() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+
+plot_grid(g1,g2,ncol=2)
+
+
+g1 <- ggplot(gains_outdat, aes(x=SRSq_microarray_last, y=SOFA_last)) +
+  geom_smooth(na.rm = T, method = "lm") +
+  geom_point(aes(color=SRS_microarray_last), size=3, na.rm = T) +
+  scale_color_manual(values=c("steelblue","darkred")) +
+  ggtitle("Microarray cohort") +
+  xlab("SRSq") +
+  ylab("Total SOFA score") +
+  stat_cor() +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+
+g2 <- ggplot(gains_outdat, aes(x=SRSq_RNAseq_last, y=SOFA_last)) +
+  geom_smooth(na.rm = T, method = "lm") +
+  geom_point(aes(color=SRS_RNAseq_last), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkblue","steelblue","darkred")) +
+  ggtitle("RNA-seq cohort") +
+  xlab("SRSq") +
+  ylab("Total SOFA score") +
+  theme_classic() +
+  stat_cor() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+
+plot_grid(g1,g2,ncol=2)
+```
+
+The association between SRS groups and APACHE scores is as follows:
+```{r plot_SRS_vs_APACHE, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_microarray_first),], aes(x=SRS_microarray_first, y=APACHE)) +
+  geom_boxplot(na.rm = T) +
+  geom_jitter(width=0.1, na.rm = T, color="darkgrey") +
+  stat_compare_means(method = "t.test", comparisons = list(c("SRS1", "SRS2"))) +
+  ggtitle("Microarray cohort") +
+  xlab("SRS group") +
+  ylab("APACHE score") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+g2 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_RNAseq_first),], aes(x=SRS_RNAseq_first, y=APACHE)) +
+  geom_boxplot(na.rm = T) +
+  geom_jitter(width=0.1, na.rm = T, color="darkgrey") +
+  stat_compare_means(method = "t.test", 
+                     comparisons = list(c("SRS1", "SRS2"), 
+                                        c("SRS2","SRS3"),
+                                        c("SRS1","SRS3"))) +
+  ggtitle("RNA-seq cohort") +
+  xlab("SRS group") +
+  ylab("APACHE score") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+plot_grid(g1,g2, ncol=2, nrow=1)
+```
+
+The same association is as follows for SRSq scores:
+```{r plot_SRSq_vs_APACHE, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(gains_outdat, aes(x=SRSq_microarray_first, y=APACHE)) +
+  geom_smooth(na.rm = T, method = "lm") +
+  geom_point(aes(color=SRS_microarray_first), size=3, na.rm = T) +
+  scale_color_manual(values=c("steelblue","darkred")) +
+  ggtitle("Microarray cohort") +
+  xlab("SRSq") +
+  ylab("APACHE score") +
+  stat_cor() +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+
+g2 <- ggplot(gains_outdat, aes(x=SRSq_RNAseq_first, y=APACHE)) +
+  geom_smooth(na.rm = T, method = "lm") +
+  geom_point(aes(color=SRS_RNAseq_first), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkblue","steelblue","darkred")) +
+  ggtitle("RNA-seq cohort") +
+  xlab("SRSq") +
+  ylab("APACHE score") +
+  stat_cor() +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+
+plot_grid(g1,g2, ncol=2)
+```
+
+The association between SRS and secondary, ICU-acquired infections is as follows:
+```{r plot_SRS_vs_ICUAinf_proportions, message=FALSE, warning=FALSE, echo=FALSE}
+# Microarray cohort
+srs_vs_secondary_infections <- data.frame()
+for(i in c("SRS1","SRS2")) {
+  dat <- gains_outdat$OICUInf[gains_outdat$SRS_microarray_last == i]
+  srs_vs_secondary_infections <- rbind(srs_vs_secondary_infections,
+                                       data.frame(
+                                         SRS=i,
+                                         Yes=mean(dat==1, na.rm=T),
+                                         No=mean(dat==0, na.rm=T))
+  )
+  }
+srs_vs_secondary_infections <- melt(srs_vs_secondary_infections)
+colnames(srs_vs_secondary_infections) <- c("SRS","ICUA_infection","Proportion")
+
+srs_vs_secondary_infections$SRS <- factor(srs_vs_secondary_infections$SRS, levels=c("SRS1","SRS2","SRS3"))
+
+ggplot(srs_vs_secondary_infections, aes(x=SRS)) +
+  geom_bar(aes(weight=Proportion, fill=ICUA_infection), width=0.5) +
+  scale_fill_manual(values=c("darkblue","lightblue")) +
+  xlab("Endotype") +
+  ylab("Proportion with ICU-acquired infections") +
+  ggtitle("Microarray cohort") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# RNA-seq cohort
+srs_vs_secondary_infections <- data.frame()
+for(i in c("SRS1","SRS2","SRS3")) {
+  dat <- gains_outdat$OICUInf[gains_outdat$SRS_RNAseq_first == i]
+  srs_vs_secondary_infections <- rbind(srs_vs_secondary_infections,
+                                       data.frame(
+                                         SRS=i,
+                                         Yes=mean(dat==1, na.rm=T),
+                                         No=mean(dat==0, na.rm=T))
+  )
+  }
+srs_vs_secondary_infections <- melt(srs_vs_secondary_infections)
+colnames(srs_vs_secondary_infections) <- c("SRS","ICUA_infection","Proportion")
+
+srs_vs_secondary_infections$SRS <- factor(srs_vs_secondary_infections$SRS, levels=c("SRS1","SRS2","SRS3"))
+
+ggplot(srs_vs_secondary_infections, aes(x=SRS)) +
+  geom_bar(aes(weight=Proportion, fill=ICUA_infection), width=0.5) +
+  scale_fill_manual(values=c("darkblue","lightblue")) +
+  xlab("Endotype") +
+  ylab("Proportion with ICU-acquired") +
+  ggtitle("RNA-seq cohort") +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+The Chi-squared test results for this comparison are as follows:
+```{r Fishers_test_ICUAinf, message=FALSE, warning=FALSE}
+# Microarray cohort
+ICUAinf_freq_per_SRS <- table(gains_outdat$OICUInf, gains_outdat$SRS_microarray_last)
+dimnames(ICUAinf_freq_per_SRS) <- list(ICUA_infection = c("No","Yes"),
+                                       Endotype = c("SRS2","SRS1"))
+
+ICUAinf_freq_per_SRS
+chisq.test(ICUAinf_freq_per_SRS)
+
+# RNA-seq cohort
+ICUAinf_freq_per_SRS <- table(gains_outdat$OICUInf, gains_outdat$SRS_RNAseq_last)
+
+dimnames(ICUAinf_freq_per_SRS) <- list(ICUA_infection = c("No","Yes"),
+                                       Endotype = c("SRS3","SRS2","SRS1"))
+
+ICUAinf_freq_per_SRS
+chisq.test(ICUAinf_freq_per_SRS)
+```
+
+The association between SRSq and the estimated severity of secondary ICU-acquired infections is as follows.
+```{r plot_SRSq_vs_ICU_infections_score, message=FALSE, warning=FALSE, echo=FALSE}
+gains_outdat$ICUAcqInfScore <- factor(gains_outdat$ICUAcqInfScore, levels = 0:9)
+g1 <- ggplot(gains_outdat[!is.na(gains_outdat$SRSq_microarray_last) & !is.na(gains_outdat$ICUAcqInfScore),],
+             aes(x=ICUAcqInfScore, y=SRSq_microarray_last)) +
+  geom_boxplot(na.rm=T) +
+  geom_jitter(aes(color=SRS_microarray_last), width=0.1, size=2, na.rm = T) +
+  scale_color_manual(values=c("steelblue","darkred")) +
+  stat_compare_means() +
+  xlab("ICU-acquired infection score") +
+  ylab("SRSq") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+g2 <- ggplot(gains_outdat[!is.na(gains_outdat$SRSq_RNAseq_last) & !is.na(gains_outdat$ICUAcqInfScore),],
+             aes(x=ICUAcqInfScore, y=SRSq_RNAseq_last)) +
+  geom_boxplot(na.rm=T) +
+  geom_jitter(aes(color=SRS_RNAseq_last), width=0.1, size=2, na.rm = T) +
+  scale_color_manual(values=c("darkblue","steelblue","darkred")) +
+  stat_compare_means() +
+  xlab("ICU-acquired infection score") +
+  ylab("SRSq") +
+  theme_classic() +
+  theme(legend.position = "none")
+
+plot_grid(g1,g2, ncol=2,nrow=1)
+```
+
+
+### Mortality
+Based on this table, we define mortality event and time to event variables. These variables are censored at 28 days.
+```{r censoring_gains_outdat, message=FALSE, warning=FALSE}
+# Estimating to death
+gains_outdat$mortality_event <- (gains_outdat$M6ddeathC != "")*1
+gains_outdat$time_to_event <- as.numeric(difftime(as.Date(gains_outdat$M6ddeathC, format = "%d/%m/%Y"),
+                                                  as.Date(gains_outdat$DhospICUC, format = "%d/%m/%Y"),
+                                                  units = "days"))
+
+# Censoring at 28 days
+gains_outdat$mortality_event_28d_censored <- gains_outdat$mortality_event
+gains_outdat$time_to_event_28d_censored <- gains_outdat$time_to_event
+
+gains_outdat$mortality_event_28d_censored[gains_outdat$time_to_event_28d_censored > 28] <- 0
+gains_outdat$time_to_event_28d_censored[gains_outdat$mortality_event_28d_censored == 0] <- 28
+```
+
+```{r plot_survival_curve_by_SRS_gains, message=FALSE, warning=FALSE, echo=FALSE}
+ggsurvplot(
+  fit = survfit(Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SRS_microarray_last,
+                data=gains_outdat), 
+  xlab = "Days since ICU admission", 
+  ylab = "Survival probability",
+  xlim = c(0,29),
+  title = "28-day survival (Microarray data)",
+  conf.int = T, 
+  pval = T,
+  palette = c("steelblue", "darkred"), 
+  legend.labs = c("SRS1", "SRS2"),
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+
+ggsurvplot(
+  fit = survfit(Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SRS_RNAseq_last,
+                data=gains_outdat[gains_outdat$SRS_RNAseq_last != "SRS3",]), 
+  xlab = "Days since ICU admission", 
+  ylab = "Survival probability",
+  xlim = c(0,29),
+  title = "28-day survival (RNA-seq data)",
+  conf.int = T, 
+  pval = T,
+  palette = c(
+    "steelblue", 
+    "darkred"),
+  legend.labs = c("SRS1","SRS2"),
+  risk.table = T, 
+  font.main = c(12, "bold"),
+  font.x = c(10, "plain"),
+  font.y = c(10, "plain"),
+  font.tickslab = c(10, "plain"), 
+  tables.height = 0.3,
+  risk.table.fontsize = 4,
+  break.time.by = 7
+)
+```
+
+We next perform a sliding window analysis to assess whether mortality tends to increase gradually for individuals with higher SRSq scores.
+
+We first fetch the necessary information and run this analysis for all samples in the microarray cohort.
+```{r run_sliding_window_survival_analysis_microarray, message=FALSE, warning=FALSE}
+vars_of_interest <- c("time_to_event_28d_censored", "mortality_event_28d_censored" ,"SRSq_microarray_last")
+gains_roll_microarray <- gains_outdat[!is.na(gains_outdat$SRSq_microarray_last),vars_of_interest]
+gains_roll_microarray <- gains_roll_microarray[order(gains_roll_microarray$SRSq_microarray_last),]
+
+window_width <- round(nrow(gains_roll_microarray)*0.35)
+
+rolling_survival_microarray <- rollapply(gains_roll_microarray, width=window_width, FUN = function(dat){
+  
+  dat <- data.frame(dat)
+  dat <- dat[!is.na(dat$SRSq_microarray_last),]
+  
+  median_SRSq <- median(dat[,"SRSq_microarray_last"])
+  
+  surv_res <- summary(survfit(Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ 1,
+                             data=dat), times=28)
+  mean_surv <- surv_res$surv
+  surv_upper <- surv_res$upper
+  surv_lower <- surv_res$lower
+  
+  res <- cbind(median_SRSq, surv_lower, mean_surv, surv_upper)
+  return(res)
+  
+  },
+  
+  by.column = F)
+
+rolling_survival_microarray <- data.frame(rolling_survival_microarray)
+```
+
+
+Next, we repeat this analysis in the RNA-seq cohort.
+```{r run_sliding_window_survival_analysis_RNAseq, message=FALSE, warning=FALSE}
+vars_of_interest <- c("time_to_event_28d_censored", "mortality_event_28d_censored" ,"SRSq_RNAseq_last")
+gains_roll_RNAseq <- gains_outdat[!is.na(gains_outdat$SRSq_RNAseq_last),vars_of_interest]
+gains_roll_RNAseq <- gains_roll_RNAseq[order(gains_roll_RNAseq$SRSq_RNAseq_last),]
+
+window_width <- round(nrow(gains_roll_RNAseq)*0.35)
+
+rolling_survival_RNAseq <- rollapply(gains_roll_RNAseq, width=window_width, FUN = function(dat){
+  
+  dat <- data.frame(dat)
+  dat <- dat[!is.na(dat$SRSq_RNAseq_last),]
+  
+  median_SRSq <- median(dat[,"SRSq_RNAseq_last"])
+  
+  surv_res <- summary(survfit(Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ 1,
+                             data=dat), times=28)
+  mean_surv <- surv_res$surv
+  surv_upper <- surv_res$upper
+  surv_lower <- surv_res$lower
+  
+  res <- cbind(median_SRSq, surv_lower, mean_surv, surv_upper)
+  return(res)
+  
+  },
+  
+  by.column = F)
+
+rolling_survival_RNAseq <- data.frame(rolling_survival_RNAseq)
+```
+
+As hypothesized, an increase in SRSq is accompanied by a proportional increase in mortality.
+```{r plot_sliding_window_survival_curves, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(rolling_survival_microarray, aes(x=median_SRSq, y=1-mean_surv)) +
+  geom_errorbar(aes(ymin=1-surv_lower, ymax=1-surv_upper), colour="lightgrey") +
+  geom_point(size=0.5) +
+  ylim(0,0.4) +
+  ggtitle("Microarray cohort") +
+  ylab("Mortality") +
+  xlab("Median SRSq") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5))
+
+ggplot(rolling_survival_RNAseq, aes(x=median_SRSq, y=1-mean_surv)) +
+  geom_errorbar(aes(ymin=1-surv_lower, ymax=1-surv_upper), colour="lightgrey") +
+  geom_point(size=0.5) +
+  ylim(0,0.4) +
+  ggtitle("RNA-seq cohort") +
+  ylab("Mortality") +
+  xlab("Median SRSq") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5))
+```
+
+In order to test if the association between SRSq and mortality is statistically significant, we model this relationship using a Cox Proportional Hazard's model. We also fit Cox models for a variety of clinicla variables which might have an impact on mortality.
+```{r fit_cox_models_microarray, message=FALSE, warning=FALSE}
+# Brining SRSq to the [0-10] range so as to make the HR estimates comparable to SOFA and SRS
+gains_outdat$SRSq_microarray_adj <- 10*gains_outdat$SRSq_microarray_last
+
+gains_outdat$SRS_microarray_last <- factor(gains_outdat$SRS_microarray_last, levels=c("SRS2","SRS1"))
+SRS_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SRS_microarray_last,
+  subset = !is.na(SRS_microarray_last),
+  data = gains_outdat
+  ))
+SRSq_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SRSq_microarray_adj, 
+  subset = !is.na(SRSq_microarray_adj), 
+  data = gains_outdat
+  ))
+SOFA_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SOFA_last, 
+  subset = !is.na(SRSq_microarray_adj), 
+  data = gains_outdat
+  ))
+APACHE_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ APACHE, 
+  subset = !is.na(SRSq_microarray_adj), 
+  data = gains_outdat
+  ))
+ICUAinf_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ ICUAcqInfScore, 
+  subset = !is.na(SRSq_microarray_adj), 
+  data = gains_outdat
+  ))
+
+cox_univariate_microarray <- data.frame(
+  variable = c("SRS (SRS1 vs SRS2)","SRSq (per 0.1 unit increase)","SOFA score (per unit increase)", "APACHE score (per unit increase)","ICU-acquired infections score"),
+  HR = c(SRS_cox$conf.int[1],
+         SRSq_cox$conf.int[1],
+         SOFA_cox$conf.int[1],
+         APACHE_cox$conf.int[1],
+         ICUAinf_cox$conf.int[1]),
+  HR_lower = c(SRS_cox$conf.int[3],
+               SRSq_cox$conf.int[3],
+               SOFA_cox$conf.int[3],
+               APACHE_cox$conf.int[3],
+               ICUAinf_cox$conf.int[3]),
+  HR_upper = c(SRS_cox$conf.int[4],
+               SRSq_cox$conf.int[4],
+               SOFA_cox$conf.int[4],
+               APACHE_cox$conf.int[4],
+               ICUAinf_cox$conf.int[4]),
+  pval = c(SRS_cox$logtest["pvalue"],
+           SRSq_cox$logtest["pvalue"],
+           SOFA_cox$logtest["pvalue"],
+           APACHE_cox$logtest["pvalue"],
+           ICUAinf_cox$logtest["pvalue"])
+)
+
+cox_univariate_microarray
+```
+
+We now build a multivariate model which tests the association between SRSq and mortality, while accounting for age and type of sepsis. We do not include SOFA or APACHE scores here, as can potentially be taggin a mediation path, and would thus eliminate or weaken the SRSq-mortality association. The results are as follows:
+```{r fit_multivariate_cox_model_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+SRSq_cox_multivariate <- coxph(Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SRSq_microarray_adj + age_bin + diagnosis,
+            subset = !is.na(SRSq_microarray_adj), 
+            data = gains_outdat)
+ggforest(SRSq_cox_multivariate)
+```
+
+Let's now repeat this analysis for the RNA-seq cohort. The hazard ratio estimates derived from univariate Cox models are as follows:
+```{r fit_cox_models_RNAseq, message=FALSE, warning=FALSE}
+# Brining SRSq to the [0-10] range so as to make the HR estimates comparable to SOFA and SRS
+gains_outdat$SRSq_RNAseq_adj <- 10*gains_outdat$SRSq_RNAseq_last
+
+SRS_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SRS_RNAseq_last,
+  subset = !is.na(SRS_RNAseq_last),
+  data = droplevels(gains_outdat[gains_outdat$SRS_RNAseq_last != "SRS3",])
+  ))
+SRSq_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SRSq_RNAseq_adj, 
+  subset = !is.na(SRSq_RNAseq_adj), 
+  data = gains_outdat
+  ))
+SOFA_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SOFA_last, 
+  subset = !is.na(SRSq_RNAseq_adj), 
+  data = gains_outdat
+  ))
+APACHE_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ APACHE, 
+  subset = !is.na(SRSq_RNAseq_adj), 
+  data = gains_outdat
+  ))
+ICUAinf_cox <- summary(coxph(
+  Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ ICUAcqInfScore, 
+  subset = !is.na(SRSq_RNAseq_adj), 
+  data = gains_outdat
+  ))
+
+cox_univariate_RNAseq <- data.frame(
+  variable = c("SRS (SRS1 vs SRS2)","SRSq (per 0.1 unit increase)","SOFA score (per unit increase)", "APACHE score (per unit increase)","ICU-acquired infections score"),
+  HR = c(SRS_cox$conf.int[1],
+         SRSq_cox$conf.int[1],
+         SOFA_cox$conf.int[1],
+         APACHE_cox$conf.int[1],
+         ICUAinf_cox$conf.int[1]),
+  HR_lower = c(SRS_cox$conf.int[3],
+               SRSq_cox$conf.int[3],
+               SOFA_cox$conf.int[3],
+               APACHE_cox$conf.int[3],
+               ICUAinf_cox$conf.int[3]),
+  HR_upper = c(SRS_cox$conf.int[4],
+               SRSq_cox$conf.int[4],
+               SOFA_cox$conf.int[4],
+               APACHE_cox$conf.int[4],
+               ICUAinf_cox$conf.int[4]),
+  pval = c(SRS_cox$logtest["pvalue"],
+           SRSq_cox$logtest["pvalue"],
+           SOFA_cox$logtest["pvalue"],
+           APACHE_cox$logtest["pvalue"],
+           ICUAinf_cox$logtest["pvalue"])
+)
+cox_univariate_RNAseq
+```
+
+The HR estimation for SRSq, accounting for age and type of sepsis, is as follows:
+```{r fit_multivariate_cox_model_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+SRSq_cox_multivariate <- coxph(Surv(time_to_event_28d_censored, mortality_event_28d_censored) ~ SRSq_RNAseq_adj + age_bin + diagnosis,
+            subset = !is.na(SRSq_RNAseq_adj), 
+            data = gains_outdat)
+ggforest(SRSq_cox_multivariate)
+```
+
+#### Disentangling the mechanisms linking SRS and mortality
+We now perform a mediation analysis to assess whether the effect of SRS on mortality is driven by organ failure (as captured by SOFA scores). If so, we also want to know what proportion of the effect of SRS in mortality is due to organ failure and what proportion is driven by other mechanisms.
+
+We start by modeling SOFA scores as a function of SRS using a linear model. This model also takes into account other variables like patient age, and the type of event which triggered sepsis.
+```{r model_mediator_variables, message=FALSE, warning=FALSE}
+## Microarray cohort
+mediator_fit_microarray <- lm(SOFA_last ~ SRSq_microarray_adj + diagnosis + age_bin, 
+                              data = gains_outdat, 
+                              subset = !is.na(SRSq_microarray_adj))
+
+## RNA-seq cohort
+mediator_fit_RNAseq <- lm(SOFA_last ~ SRSq_RNAseq_adj + diagnosis + age_bin,
+                          data = gains_outdat, 
+                          subset = !is.na(SRSq_RNAseq_adj))
+```
+
+We next model the probability of death as a function of SOFA scores and SRS. We do this by using a logistic regression and assuming mortality follows a binomial distribution.
+```{r model_outcome_variables, message=FALSE, warning=FALSE}
+outcome_fit_microarray <- glm(mortality_event_28d_censored ~ SRSq_microarray_adj + SOFA_last + diagnosis + age_bin, 
+                              family = binomial(link="probit"), 
+                              data = gains_outdat,
+                              subset = !is.na(SRSq_microarray_adj))
+
+outcome_fit_RNAseq <- glm(mortality_event_28d_censored ~ SRSq_RNAseq_adj + SOFA_last + diagnosis + age_bin, 
+                          family = binomial(link="probit"), 
+                          data = gains_outdat,
+                          subset = !is.na(SRSq_RNAseq_adj))
+```
+
+Finally, we use the functions in the mediation package to integrate both models and assess the average causal mediation effect (ACME) and average direct effect (ADE) of SRS on mortality. ACME represents the increase in mortality due to SRS which is caused by organ failure, while ADE represents the increase in mortality due to other mechanisms downstream of the SRS signal. 
+```{r estimate_causal_effects, message=FALSE, warning=FALSE}
+mediation_res_microarray <- mediate(mediator_fit_microarray, outcome_fit_microarray, 
+                                    treat = "SRSq_microarray_adj", 
+                                    mediator = "SOFA_last", 
+                                    sims = 1000, 
+                                    treat.value = median(gains_outdat$SRSq_microarray_adj[gains_outdat$SRS_microarray_last %in% c("SRS1")]), 
+                                    control.value = median(gains_outdat$SRSq_microarray_adj[gains_outdat$SRS_microarray_last %in% c("SRS2")]))
+
+mediation_res_RNAseq <- mediate(mediator_fit_RNAseq, outcome_fit_RNAseq, 
+                                treat = "SRSq_RNAseq_adj", 
+                                mediator = "SOFA_last", 
+                                sims = 1000, 
+                                treat.value = median(gains_outdat$SRSq_RNAseq_adj[gains_outdat$SRS_RNAseq_last %in% c("SRS1")]), 
+                                control.value = median(gains_outdat$SRSq_RNAseq_adj[gains_outdat$SRS_RNAseq_last %in% c("SRS2")]))
+```
+
+The estimated causal effects are as follows for the microarray cohort:
+```{r print_causal_effects_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+summary(mediation_res_microarray)
+```
+
+
+```{r plot_causal_effects_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+plot(mediation_res_microarray, main="Microarray cohort", xlab="Estimated effect size", xlim=c(0,0.2))
+```
+
+And as follows for the RNA-seq cohort:
+```{r print_causal_effects_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+summary(mediation_res_RNAseq)
+```
+
+```{r plot_causal_effects_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+plot(mediation_res_RNAseq, main="RNA-seq cohort", xlab="Estimated effect size", xlim=c(-0.02,0.1))
+```
+
+This corresponds to the following conclusion:
+```{r plot_proportion_explained_by_mediators, message=FALSE, warning=FALSE, echo=FALSE}
+cat("Proportion of the effect of SRS on mortality mediated by organ failure (Microarray): ", round(mediation_res_microarray$n.avg*100,2), "%", sep="")
+cat("\nProportion of the effect of SRS on mortality mediated by organ failure (RNA-seq): ", round(mediation_res_RNAseq$n.avg*100,2), "%", sep="")
+```
+
+```{r run_sensitivity_analysis_SOFA, eval=FALSE, echo=FALSE}
+sensitivity_results_microarray <- medsens(mediation_res_microarray, rho.by = 0.1, effect.type = "indirect", sims = 1000)
+sensitivity_results_RNAseq <- medsens(mediation_res_RNAseq, rho.by = 0.1, effect.type = "indirect", sims = 1000)
+
+plot(sensitivity_results_microarray)
+plot(sensitivity_results_RNAseq)
+```
+
+
+##### Assessing the causal role of each organ system in mortality
+Let's now analyse which specific organ system dysfunction tends to mediate the association with mortality.
+
+We begin by analysing the relationship between SRSq and each of the clinical measurements designed to monitor organ function.
+```{r plot_SRS_vs_individual_clinical_measurements, message=FALSE, warning=FALSE, echo=FALSE}
+g1 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_microarray_last),], aes(x=SRSq_microarray_last, y=MAP_lowest_last)) +
+  geom_point(aes(color=SRS_microarray_last), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  geom_smooth(method="lm", na.rm = T) +
+  stat_cor(na.rm = T) +
+  ggtitle("Lowest MAP") +
+  ylab("mmHg") +
+  xlab("SRSq") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), plot.title = element_text(hjust=0.5), legend.position = "none")
+g2 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_microarray_last),], aes(x=SRSq_microarray_last, y=PF_ratio_last)) +
+  geom_point(aes(color=SRS_microarray_last), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+   geom_smooth(method="lm", na.rm = T) +
+  stat_cor(na.rm = T) +
+  ggtitle("PaO2/FiO2 ratio") +
+  ylab("mmHg") +
+  xlab("SRSq") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), plot.title = element_text(hjust=0.5), legend.position = "none")
+g3 <-  ggplot(gains_outdat[!is.na(gains_outdat$SRS_microarray_last),], aes(x=SRSq_microarray_last, y=Creatinine_highest_last)) +
+  geom_point(aes(color=SRS_microarray_last), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  geom_smooth(method="lm", na.rm = T) +
+  stat_cor(na.rm = T) +
+  ggtitle("Creatinine") +
+  ylab("umol/l") +
+  xlab("SRSq") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), plot.title = element_text(hjust=0.5), legend.position = "none")
+g4 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_microarray_last),], aes(x=SRSq_microarray_last, y=Bilirubin_highest_last)) +
+  geom_point(aes(color=SRS_microarray_last), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  geom_smooth(method="lm", na.rm = T) +
+  stat_cor(na.rm = T) +
+  ggtitle("Bilirubin") +
+  ylab("umol/l") +
+  xlab("SRSq") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), plot.title = element_text(hjust=0.5), legend.position = "none")
+g5 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_microarray_last),], aes(x=SRSq_microarray_last, y=Platelets_lowest_last)) +
+  geom_point(aes(color=SRS_microarray_last), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  geom_smooth(method="lm", na.rm = T) +
+  stat_cor(na.rm = T) +
+  ggtitle("Platelets") +
+  ylab("1x103 cells/ul") +
+  xlab("SRSq") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), plot.title = element_text(hjust=0.5), legend.position = "none")
+#plot_grid(g1,g2,g3,g4,g5,ncol=3,nrow=2)
+
+g6 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_RNAseq_last),], aes(x=SRSq_RNAseq_last, y=MAP_lowest_last)) +
+  geom_point(aes(color=SRS_RNAseq_last), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkblue","steelblue","darkred")) +
+  geom_smooth(method="lm", na.rm = T) +
+  stat_cor(na.rm = T) +
+  ggtitle("Lowest MAP") +
+  ylab("mmHg") +
+  xlab("SRSq") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), plot.title = element_text(hjust=0.5), legend.position = "none")
+g7 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_RNAseq_last),], aes(x=SRSq_RNAseq_last, y=PF_ratio_last)) +
+  geom_point(aes(color=SRS_RNAseq_last), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkblue","steelblue","darkred")) +
+  geom_smooth(method="lm", na.rm = T) +
+  stat_cor(na.rm = T) +
+  ggtitle("PaO2/FiO2 ratio") +
+  ylab("mmHg") +
+  xlab("SRSq") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), plot.title = element_text(hjust=0.5), legend.position = "none")
+g8 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_RNAseq_last),], aes(x=SRSq_RNAseq_last, y=Creatinine_highest_last)) +
+  geom_point(aes(color=SRS_RNAseq_last), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkblue","steelblue","darkred")) +
+  geom_smooth(method="lm", na.rm = T) +
+  stat_cor(na.rm = T) +
+  ggtitle("Creatinine") +
+  ylab("umol/l") +
+  xlab("SRSq") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), plot.title = element_text(hjust=0.5), legend.position = "none")
+g9 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_RNAseq_last),], aes(x=SRSq_RNAseq_last, y=Bilirubin_highest_last)) +
+  geom_point(aes(color=SRS_RNAseq_last), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkblue","steelblue","darkred")) +
+  geom_smooth(method="lm", na.rm = T) +
+  stat_cor(na.rm = T) +
+  ggtitle("Bilirubin") +
+  ylab("umol/l") +
+  xlab("SRSq") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), plot.title = element_text(hjust=0.5), legend.position = "none")
+g10 <- ggplot(gains_outdat[!is.na(gains_outdat$SRS_RNAseq_last),], aes(x=SRSq_RNAseq_last, y=Platelets_lowest_last)) +
+  geom_point(aes(color=SRS_RNAseq_last), size=3, na.rm = T) +
+  scale_color_manual(values=c("darkblue","steelblue","darkred")) +
+  geom_smooth(method="lm", na.rm = T) +
+  stat_cor(na.rm = T) +
+  ggtitle("Platelets") +
+  ylab("1x103 cells/ul") +
+  xlab("SRSq") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), plot.title = element_text(hjust=0.5), legend.position = "none")
+plot_grid(g1,g2,g3,g4,g5,g6,g7,g8,g9,g10, ncol=5, nrow=2)
+```
+
+We then test for significant mediation of these variables in the path between SRS and death
+```{r model_mediator_variables_per_organ, message=FALSE, warning=FALSE}
+## Microarray cohort
+mediator_fit_resp_microarray <- lm(PF_ratio_last ~ SRSq_microarray_adj + diagnosis + age_bin, 
+                              data = gains_outdat,
+                              subset = !is.na(SRSq_microarray_adj))
+mediator_fit_cardio_microarray <- lm(MAP_lowest_last ~ SRSq_microarray_adj + diagnosis + age_bin, 
+                              data = gains_outdat, 
+                              subset = !is.na(SRSq_microarray_adj))
+mediator_fit_liver_microarray <- lm(Bilirubin_highest_last ~ SRSq_microarray_adj + diagnosis + age_bin, 
+                              data = gains_outdat, 
+                              subset = !is.na(SRSq_microarray_adj))
+mediator_fit_kidney_microarray <- lm(Creatinine_highest_last ~ SRSq_microarray_adj + diagnosis + age_bin, 
+                              data = gains_outdat, 
+                              subset = !is.na(SRSq_microarray_adj))
+mediator_fit_coag_microarray <- lm(Platelets_lowest_last ~ SRSq_microarray_adj + diagnosis + age_bin, 
+                              data = gains_outdat, 
+                              subset = !is.na(SRSq_microarray_adj))
+
+## RNA-seq cohort
+mediator_fit_resp_RNAseq <- lm(PF_ratio_last ~ SRSq_RNAseq_adj + diagnosis + age_bin,
+                               data = gains_outdat,
+                               subset = !is.na(SRSq_RNAseq_adj))
+mediator_fit_cardio_RNAseq <- lm(MAP_lowest_last ~ SRSq_RNAseq_adj + diagnosis + age_bin, 
+                              data = gains_outdat, 
+                              subset = !is.na(SRSq_RNAseq_adj))
+mediator_fit_liver_RNAseq <- lm(Bilirubin_highest_last ~ SRSq_RNAseq_adj + diagnosis + age_bin, 
+                              data = gains_outdat, 
+                              subset = !is.na(SRSq_RNAseq_adj))
+mediator_fit_kidney_RNAseq <- lm(Creatinine_highest_last ~ SRSq_RNAseq_adj + diagnosis + age_bin, 
+                              data = gains_outdat, 
+                              subset = !is.na(SRSq_RNAseq_adj))
+mediator_fit_coag_RNAseq <- lm(Platelets_lowest_last ~ SRSq_RNAseq_adj + diagnosis + age_bin, 
+                              data = gains_outdat, 
+                              subset = !is.na(SRSq_RNAseq_adj))
+```
+
+```{r model_outcome_variables_per_organ, message=FALSE, warning=FALSE}
+## Microarray cohort
+outcome_fit_resp_microarray <- glm(mortality_event_28d_censored ~ SRSq_microarray_adj + PF_ratio_last + diagnosis + age_bin, 
+                              family = binomial(link="probit"), 
+                              data = gains_outdat,
+                              subset = !is.na(SRSq_microarray_adj))
+outcome_fit_cardio_microarray <- glm(mortality_event_28d_censored ~ SRSq_microarray_adj + MAP_lowest_last + diagnosis + age_bin, 
+                              family = binomial(link="probit"), 
+                              data = gains_outdat,
+                              subset = !is.na(SRSq_microarray_adj))
+outcome_fit_liver_microarray <- glm(mortality_event_28d_censored ~ SRSq_microarray_adj + Bilirubin_highest_last + diagnosis + age_bin, 
+                              family = binomial(link="probit"), 
+                              data = gains_outdat,
+                              subset = !is.na(SRSq_microarray_adj))
+outcome_fit_kidney_microarray <- glm(mortality_event_28d_censored ~ SRSq_microarray_adj + Creatinine_highest_last + diagnosis + age_bin, 
+                              family = binomial(link="probit"), 
+                              data = gains_outdat,
+                              subset = !is.na(SRSq_microarray_adj))
+outcome_fit_coag_microarray <- glm(mortality_event_28d_censored ~ SRSq_microarray_adj + Platelets_lowest_last + diagnosis + age_bin, 
+                              family = binomial(link="probit"), 
+                              data = gains_outdat,
+                              subset = !is.na(SRSq_microarray_adj))
+
+## RNA-seq cohort
+outcome_fit_resp_RNAseq <- glm(mortality_event_28d_censored ~ SRSq_RNAseq_adj + PF_ratio_last + diagnosis + age_bin, 
+                          family = binomial(link="probit"), 
+                          data = gains_outdat,
+                          subset = !is.na(SRSq_RNAseq_adj))
+outcome_fit_cardio_RNAseq <- glm(mortality_event_28d_censored ~ SRSq_RNAseq_adj + MAP_lowest_last + diagnosis + age_bin, 
+                          family = binomial(link="probit"), 
+                          data = gains_outdat,
+                          subset = !is.na(SRSq_RNAseq_adj))
+outcome_fit_liver_RNAseq <- glm(mortality_event_28d_censored ~ SRSq_RNAseq_adj + Bilirubin_highest_last + diagnosis + age_bin, 
+                          family = binomial(link="probit"), 
+                          data = gains_outdat,
+                          subset = !is.na(SRSq_RNAseq_adj))
+outcome_fit_kidney_RNAseq <- glm(mortality_event_28d_censored ~ SRSq_RNAseq_adj + Creatinine_highest_last + diagnosis + age_bin, 
+                          family = binomial(link="probit"), 
+                          data = gains_outdat,
+                          subset = !is.na(SRSq_RNAseq_adj))
+outcome_fit_coag_RNAseq <- glm(mortality_event_28d_censored ~ SRSq_RNAseq_adj + Platelets_lowest_last + diagnosis + age_bin, 
+                          family = binomial(link="probit"), 
+                          data = gains_outdat,
+                          subset = !is.na(SRSq_RNAseq_adj))
+```
+
+```{r estimate_causal_effects_per_organ, message=FALSE, warning=FALSE}
+## Microarray cohort
+mediation_res_resp_microarray <- mediate(mediator_fit_resp_microarray, outcome_fit_resp_microarray, 
+                                    treat = "SRSq_microarray_adj", 
+                                    mediator = "PF_ratio_last", 
+                                    sims = 1000, 
+                                    treat.value = median(gains_outdat$SRSq_microarray_adj[gains_outdat$SRS_microarray_last %in% c("SRS1")]), 
+                                    control.value = median(gains_outdat$SRSq_microarray_adj[gains_outdat$SRS_microarray_last %in% c("SRS2")]))
+mediation_res_cardio_microarray <- mediate(mediator_fit_cardio_microarray, outcome_fit_cardio_microarray, 
+                                    treat = "SRSq_microarray_adj", 
+                                    mediator = "MAP_lowest_last", 
+                                    sims = 1000, 
+                                    treat.value = median(gains_outdat$SRSq_microarray_adj[gains_outdat$SRS_microarray_last %in% c("SRS1")]), 
+                                    control.value = median(gains_outdat$SRSq_microarray_adj[gains_outdat$SRS_microarray_last %in% c("SRS2")]))
+mediation_res_liver_microarray <- mediate(mediator_fit_liver_microarray, outcome_fit_liver_microarray, 
+                                    treat = "SRSq_microarray_adj", 
+                                    mediator = "Bilirubin_highest_last", 
+                                    sims = 1000, 
+                                    treat.value = median(gains_outdat$SRSq_microarray_adj[gains_outdat$SRS_microarray_last %in% c("SRS1")]), 
+                                    control.value = median(gains_outdat$SRSq_microarray_adj[gains_outdat$SRS_microarray_last %in% c("SRS2")]))
+mediation_res_kidney_microarray <- mediate(mediator_fit_kidney_microarray, outcome_fit_kidney_microarray, 
+                                    treat = "SRSq_microarray_adj", 
+                                    mediator = "Creatinine_highest_last", 
+                                    sims = 1000, 
+                                    treat.value = median(gains_outdat$SRSq_microarray_adj[gains_outdat$SRS_microarray_last %in% c("SRS1")]), 
+                                    control.value = median(gains_outdat$SRSq_microarray_adj[gains_outdat$SRS_microarray_last %in% c("SRS2")]))
+mediation_res_coag_microarray <- mediate(mediator_fit_coag_microarray, outcome_fit_coag_microarray, 
+                                    treat = "SRSq_microarray_adj", 
+                                    mediator = "Platelets_lowest_last", 
+                                    sims = 1000, 
+                                    treat.value = median(gains_outdat$SRSq_microarray_adj[gains_outdat$SRS_microarray_last %in% c("SRS1")]), 
+                                    control.value = median(gains_outdat$SRSq_microarray_adj[gains_outdat$SRS_microarray_last %in% c("SRS2")]))
+
+## RNA-seq cohort
+mediation_res_resp_RNAseq <- mediate(mediator_fit_resp_RNAseq, outcome_fit_resp_RNAseq, 
+                                treat = "SRSq_RNAseq_adj", 
+                                mediator = "PF_ratio_last", 
+                                sims = 1000, 
+                                treat.value = median(gains_outdat$SRSq_RNAseq_adj[gains_outdat$SRS_RNAseq_last %in% c("SRS1")]), 
+                                control.value = median(gains_outdat$SRSq_RNAseq_adj[gains_outdat$SRS_RNAseq_last %in% c("SRS2")]))
+mediation_res_cardio_RNAseq <- mediate(mediator_fit_cardio_RNAseq, outcome_fit_cardio_RNAseq, 
+                                treat = "SRSq_RNAseq_adj", 
+                                mediator = "MAP_lowest_last", 
+                                sims = 1000, 
+                                treat.value = median(gains_outdat$SRSq_RNAseq_adj[gains_outdat$SRS_RNAseq_last %in% c("SRS1")]), 
+                                control.value = median(gains_outdat$SRSq_RNAseq_adj[gains_outdat$SRS_RNAseq_last %in% c("SRS2")]))
+mediation_res_liver_RNAseq <- mediate(mediator_fit_liver_RNAseq, outcome_fit_liver_RNAseq, 
+                                treat = "SRSq_RNAseq_adj", 
+                                mediator = "Bilirubin_highest_last", 
+                                sims = 1000, 
+                                treat.value = median(gains_outdat$SRSq_RNAseq_adj[gains_outdat$SRS_RNAseq_last %in% c("SRS1")]), 
+                                control.value = median(gains_outdat$SRSq_RNAseq_adj[gains_outdat$SRS_RNAseq_last %in% c("SRS2")]))
+mediation_res_kidney_RNAseq <- mediate(mediator_fit_kidney_RNAseq, outcome_fit_kidney_RNAseq, 
+                                treat = "SRSq_RNAseq_adj", 
+                                mediator = "Creatinine_highest_last", 
+                                sims = 1000, 
+                                treat.value = median(gains_outdat$SRSq_RNAseq_adj[gains_outdat$SRS_RNAseq_last %in% c("SRS1")]), 
+                                control.value = median(gains_outdat$SRSq_RNAseq_adj[gains_outdat$SRS_RNAseq_last %in% c("SRS2")]))
+mediation_res_coag_RNAseq <- mediate(mediator_fit_coag_RNAseq, outcome_fit_coag_RNAseq, 
+                                treat = "SRSq_RNAseq_adj", 
+                                mediator = "Platelets_lowest_last", 
+                                sims = 1000, 
+                                treat.value = median(gains_outdat$SRSq_RNAseq_adj[gains_outdat$SRS_RNAseq_last %in% c("SRS1")]), 
+                                control.value = median(gains_outdat$SRSq_RNAseq_adj[gains_outdat$SRS_RNAseq_last %in% c("SRS2")]))
+```
+
+The estimated causal effects are as follows for the microarray cohort:
+```{r plot_causal_effects_microarray_per_organ, message=FALSE, warning=FALSE, echo=FALSE}
+plot(mediation_res_resp_microarray, main="Respiratory function (Microarray)", xlab="Estimated effect size", xlim=c(0,0.2))
+plot(mediation_res_cardio_microarray, main="Cardiovascular function (Microarray)", xlab="Estimated effect size", xlim=c(0,0.2))
+plot(mediation_res_liver_microarray, main="Liver function (Microarray)", xlab="Estimated effect size", xlim=c(0,0.2))
+plot(mediation_res_kidney_microarray, main="Kidney function (Microarray)", xlab="Estimated effect size", xlim=c(0,0.2))
+plot(mediation_res_coag_microarray, main="Coagulation function (Microarray)", xlab="Estimated effect size", xlim=c(0,0.2))
+```
+
+P values are as follows:
+```{r print_causal_effect_p_values_microarray_per_organ, message=FALSE, warning=FALSE, echo=FALSE}
+cat("ACME p values\n\n")
+cat("Respiratory function:", mediation_res_resp_microarray$d1.p, "\n")
+cat("Cardiovascular function:", mediation_res_cardio_microarray$d1.p, "\n")
+cat("Liver function:", mediation_res_liver_microarray$d1.p, "\n")
+cat("Kidney function:", mediation_res_kidney_microarray$d1.p, "\n")
+cat("Coagulation function:", mediation_res_coag_microarray$d1.p, "\n")
+```
+
+The proportion of the SRSq effect on mortality mediated by each of these variables is as follows:
+```{r proportion_explained_by_organ_mediators_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+cat("Proportion of effects mediated by each variable\n\n")
+cat("Respiratory function: ", round(mediation_res_resp_microarray$n.avg*100,2), "%\n", sep="")
+cat("Cardiovascular function: ", round(mediation_res_cardio_microarray$n.avg*100,2), "%\n", sep="")
+cat("Liver function: ", round(mediation_res_liver_microarray$n.avg*100,2), "%\n", sep="")
+cat("Kidney function: ", round(mediation_res_kidney_microarray$n.avg*100,2), "%\n", sep="")
+cat("Coagulation function: ", round(mediation_res_coag_microarray$n.avg*100,2), "%\n", sep="")
+```
+
+
+The estimated causal effects are as follows for the RNA-seq cohort:
+```{r plot_causal_effects_RNAseq_per_organ, message=FALSE, warning=FALSE, echo=FALSE}
+plot(mediation_res_resp_RNAseq, main="Respiratory function (RNA-seq)", xlab="Estimated effect size", xlim=c(-0.02,0.1))
+plot(mediation_res_cardio_RNAseq, main="Cardiovascular function (RNA-seq)", xlab="Estimated effect size", xlim=c(-0.02,0.1))
+plot(mediation_res_liver_RNAseq, main="Liver function (RNA-seq)", xlab="Estimated effect size", xlim=c(-0.02,0.1))
+plot(mediation_res_kidney_RNAseq, main="Kidney function (RNA-seq)", xlab="Estimated effect size", xlim=c(-0.02,0.1))
+plot(mediation_res_coag_RNAseq, main="Coagulation function (RNA-seq)", xlab="Estimated effect size", xlim=c(-0.02,0.1))
+```
+
+With the following p values:
+```{r print_causal_effect_p_values_RNAseq_per_organ, message=FALSE, warning=FALSE, echo=FALSE}
+cat("ACME p values\n\n")
+cat("Respiratory function:", mediation_res_resp_RNAseq$d1.p, "\n")
+cat("Cardiovascular function:", mediation_res_cardio_RNAseq$d1.p, "\n")
+cat("Liver function:", mediation_res_liver_RNAseq$d1.p, "\n")
+cat("Kidney function:", mediation_res_kidney_RNAseq$d1.p, "\n")
+cat("Coagulation function:", mediation_res_coag_RNAseq$d1.p, "\n")
+```
+
+The proportion of the SRSq effect on mortality mediated by each of these variables is as follows:
+```{r proportion_explained_by_organ_mediators_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+cat("Proportion of effects mediated by each variable\n\n")
+cat("Respiratory function: ", round(mediation_res_resp_RNAseq$n.avg*100,2), "%\n", sep="")
+cat("Cardiovascular function: ", round(mediation_res_cardio_RNAseq$n.avg*100,2), "%\n", sep="")
+cat("Liver function: ", round(mediation_res_liver_RNAseq$n.avg*100,2), "%\n", sep="")
+cat("Kidney function: ", round(mediation_res_kidney_RNAseq$n.avg*100,2), "%\n", sep="")
+cat("Coagulation function: ", round(mediation_res_coag_RNAseq$n.avg*100,2), "%\n", sep="")
+```
+
+### Blood cell counts
+Let's now analyze the correlation of SRSq scores with blood cell counts. We start by importing cell count measurements as registered in hospital.
+```{r import_cell_counts, message=FALSE, warning=FALSE}
+gains_cell_counts <- read.csv("../data/gains_clinical_data/cellCountDat21072021.csv")
+gains_cell_counts$SampleID <- paste(gains_cell_counts$SubjectBarCode, gsub("Day","",gains_cell_counts$StudyEventId), sep="_")
+```
+
+We then combine this information with the respective SRSq score for each sample.
+```{r combine_SRS_with_cell_counts, message=FALSE, warning=FALSE}
+SRS_labels_for_cell_counts <- data.frame()
+for(sample_id in gains_cell_counts$SampleID){
+  
+  # Microarray
+  if( !sample_id %in% colnames(gains_microarray) ){
+    SRS_microarray <- NA
+    SRSq_microarray < NA
+  } else{
+    dat_microarray <- colData(gains_microarray)[sample_id,]
+  SRS_microarray = as.character(dat_microarray$SRS_rf_mnn)
+  SRSq_microarray = round(dat_microarray$SRSq,3)
+  }
+  
+  # RNA-seq
+  if( !sample_id %in% colnames(gains_RNAseq) ){
+    SRS_RNAseq <- NA
+    SRSq_RNAseq <- NA
+  } else{
+    dat_RNAseq <- colData(gains_RNAseq)[sample_id,]
+    SRS_RNAseq = as.character(dat_RNAseq$SRS_rf_mnn)
+    SRSq_RNAseq = round(dat_RNAseq$SRSq,3)
+  }
+  
+  SRS_labels_for_cell_counts <- rbind(SRS_labels_for_cell_counts, 
+                                      c(SRS_microarray,SRS_RNAseq, SRSq_microarray, SRSq_RNAseq))
+  
+}
+colnames(SRS_labels_for_cell_counts) <- c("SRS_microarray","SRS_RNAseq",
+                                          "SRSq_microarray","SRSq_RNAseq")
+
+gains_cell_counts <- cbind(gains_cell_counts, SRS_labels_for_cell_counts)
+
+gains_cell_counts$SRSq_microarray <- as.numeric(gains_cell_counts$SRSq_microarray)
+gains_cell_counts$SRSq_RNAseq <- as.numeric(gains_cell_counts$SRSq_RNAseq)
+```
+
+The associations between SRS/SRSq and the three measured cell types look as follows in the microarray cohort:
+```{r plot_cell_count_and_SRS_associations_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(gains_cell_counts[gains_cell_counts$variable %in% c("Lymphocytes","Mononuclear leukocytes","Polymorphonuclear leukocytes") &  !is.na(gains_cell_counts$SRSq_microarray),], 
+       aes(x=SRSq_microarray, y=log10(value+1))) +
+  geom_smooth(method="lm", na.rm = T) + 
+  geom_point(aes(color=SRS_microarray),size=2,alpha=0.6, na.rm=T) +
+  scale_color_manual(values=c("darkred","steelblue")) +
+  stat_cor(na.rm = T) +
+  facet_grid(~variable) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "none")
+
+ggplot(gains_cell_counts[gains_cell_counts$variable %in% c("Lymphocytes","Mononuclear leukocytes","Polymorphonuclear leukocytes") & !is.na(gains_cell_counts$SRS_microarray),], 
+       aes(x=SRS_microarray, y=log10(value+1))) +
+  geom_boxplot() +
+  geom_jitter(alpha=0.5, width=0.1, color="darkgrey") +
+  stat_compare_means(method = "t.test", 
+                     comparisons = list(c("SRS1", "SRS2"))
+                     ) +
+  facet_grid(~variable) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+The associations between SRS/SRSq and the three measured cell types look as follows in the RNA-seq cohort:
+```{r plot_cell_count_and_SRS_associations_RNAseq, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(gains_cell_counts[gains_cell_counts$variable %in% c("Lymphocytes","Mononuclear leukocytes","Polymorphonuclear leukocytes") &  !is.na(gains_cell_counts$SRSq_RNAseq),], 
+       aes(x=SRSq_RNAseq, y=log10(value+1))) +
+  geom_smooth(method="lm", na.rm = T) + 
+  geom_point(aes(color=SRS_RNAseq),size=2,alpha=0.6, na.rm=T) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_cor(na.rm = T) +
+  facet_grid(~variable) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), 
+        legend.position = "none")
+
+ggplot(gains_cell_counts[gains_cell_counts$variable %in% c("Lymphocytes","Mononuclear leukocytes","Polymorphonuclear leukocytes") & !is.na(gains_cell_counts$SRS_RNAseq),], 
+       aes(x=SRS_RNAseq, y=log10(value+1))) +
+  geom_boxplot() +
+  geom_jitter(alpha=0.5, width=0.1, color="darkgrey") +
+  stat_compare_means(method = "t.test", 
+                     comparisons = list(c("SRS1", "SRS2"),
+                                        c("SRS2","SRS3"),
+                                        c("SRS1","SRS3"))
+                     ) +
+  facet_grid(~variable) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Comparing predictions obtained using the extended (19 genes) and the Davenport (7 genes) gene sets
+
+Let's now assess how these predictions compare to those obtained using only the 7 gene signature proposed by Davenport et al. We begin by transforming the obtained predictions to a format suitable for comparison
+```{r format_predictions_to_export, message=FALSE, warning=FALSE}
+SRS_predictions_gains <- rbind(
+  data.frame(
+    Sample_id=gains_microarray$SampleID,
+    Assay="Microarray",
+    SRS=gains_microarray$SRS_rf_mnn,
+    SRSq=round(gains_microarray$SRSq, 4)
+    ),
+  
+  data.frame(
+    Sample_id=gains_RNAseq$SampleID,
+    Assay="RNA-seq",
+    SRS=gains_RNAseq$SRS_rf_mnn,
+    SRSq=round(gains_RNAseq$SRSq, 4)
+    )
+)
+```
+
+We then load a table with predictions obtained using the 7-gene signature
+```{r load_7_gene_model_predictions, message=FALSE, warning=FALSE}
+SRS_preds <- read.table("../results/classifier_predictions/full-gains-SRS-predictions_mNN-RF.tsv", sep="\t", header=T)
+SRS_preds <- SRS_preds[SRS_preds$Assay != "qPCR",]
+```
+
+The agreement between SRS classification using both systems is as follows:
+```{r create_upset_plot_davenport_vs_extended_predictions, message=FALSE, warning=FALSE, echo=FALSE}
+upset(
+  fromList(
+    list(
+      "SRS1 (Davenport set)" = SRS_preds$Sample_id[SRS_preds$Assay=="Microarray" & SRS_preds$SRS=="SRS1"],
+      "SRS1 (Extended set)" = gains_microarray$SampleID[gains_microarray$SRS_rf_mnn=="SRS1"],
+      "SRS2 (Davenport set)" = SRS_preds$Sample_id[SRS_preds$Assay=="Microarray" & SRS_preds$SRS=="SRS2"],
+      "SRS2 (Extended set)" = gains_microarray$SampleID[gains_microarray$SRS_rf_mnn=="SRS2"]
+      )
+    ), 
+  order.by = "freq"
+)
+
+upset(
+  fromList(
+    list(
+      "SRS1 (Davenport set)" = SRS_preds$Sample_id[SRS_preds$Assay=="RNA-seq" & SRS_preds$SRS=="SRS1"],
+      "SRS1 (Extended set)" = gains_RNAseq$SampleID[gains_RNAseq$SRS_rf_mnn=="SRS1"],
+      "SRS2 (Davenport set)" = SRS_preds$Sample_id[SRS_preds$Assay=="RNA-seq" & SRS_preds$SRS=="SRS2"],
+      "SRS2 (Extended set)" = gains_RNAseq$SampleID[gains_RNAseq$SRS_rf_mnn=="SRS2"],
+      "SRS3 (Davenport set)" = SRS_preds$Sample_id[SRS_preds$Assay=="RNA-seq" & SRS_preds$SRS=="SRS3"],
+      "SRS3 (Extended set)" = gains_RNAseq$SampleID[gains_RNAseq$SRS_rf_mnn=="SRS3"]
+      )
+    ), 
+  order.by = "freq", nsets = 6
+)
+```
+
+The agreement between SRSq predictions is as follows:
+```{r compare_SRSq_between_classifiers, message=FALSE, warning=FALSE, echo=FALSE}
+plot(SRS_preds$SRSq, SRS_predictions_gains$SRSq, 
+     xlab="SRSq (7-gene set)", 
+     ylab="SRSq (19-gene set)",
+     pch=19,
+     col="darkgrey")
+abline(0,1, col="darkred")
+```
+
+## Exporting results
+Finally, we export all SRS and SRSq predictions form this model as TSV file.
+```{r export_predictions, eval=FALSE}
+write.table(SRS_predictions_gains,
+            "../results/classifier_predictions/gains-SRS-predictions_extended-gene-set_mNN-RF.tsv",
+            sep="\t", quote = F, row.names = F)
+```
+
+## R session
+```{r r_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```
+

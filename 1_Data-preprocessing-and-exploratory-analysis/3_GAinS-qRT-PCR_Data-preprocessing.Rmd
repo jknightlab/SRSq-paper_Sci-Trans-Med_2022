@@ -1,0 +1,148 @@
+---
+title: "Exploratory data analysis of GAinS qPCR data"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This markdown document contains a general exploratory analysis of a qPCR data set for the GAinS study. This data set contains measurements on the 7 genes sepsis response signature (SRS) classifier genes across 133 individuals. 
+
+This data was previously processed and quality controlled by Cyndi Goh. 
+
+## Loading libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(SummarizedExperiment)
+library(annotables)
+library(limma)
+```
+
+## Loading data
+Loading GAinS qPCR data
+```{r load_data, message=FALSE, warning=FALSE}
+qpcr_data <- read.csv("../data/GAinS_qPCR_data.csv")
+```
+
+Loading GAinS RNA-seq data (this will be used to extract metadata fields for common samples between both data sets).
+```{r load_RNAseq, message=FALSE, warning=FALSE}
+gains_RNAseq <- readRDS("../data/gains_full_RNAseq_norm_log2-cpm.rds")
+```
+
+## Pre-processing and formatting data
+For samples profiled in duplicate, we keep only one of them.
+```{r remove_duplicates, message=FALSE, warning=FALSE}
+qpcr_data <- qpcr_data[qpcr_data$Dataset != "Duplicate",]
+rownames(qpcr_data) <- qpcr_data$Barcode
+```
+
+We then create a metadata table for the remaining samples, using information from both the qPCR and the RNA-seq studies.
+```{r add_metadata, message=FALSE, warning=FALSE}
+sample_info <- data.frame(
+  Dataset = qpcr_data$Dataset,
+  Cohort = qpcr_data$Cohort,
+  SRS_New = qpcr_data$SRS_New,
+  SRSModel = colData(gains_RNAseq)[rownames(qpcr_data),]$SRSModel,
+  SRSUnsup = colData(gains_RNAseq)[rownames(qpcr_data),]$SRSUnsup, 
+  row.names = rownames(qpcr_data)
+)
+
+head(sample_info)
+```
+
+We next apply a log-transformation to bring everything to a symmetric (Gaussian-like) distribution.
+```{r log_transform, message=FALSE, warning=FALSE}
+log_qpcr <- t(log2(qpcr_data[,3:9]))
+colnames(log_qpcr) <- qpcr_data$Barcode
+```
+
+We also obtain some information on the 7 genes (such as chromosomal positions and Ensembl IDs) using the annotations in the annotables package.
+```{r create_gene_annotations, message=FALSE, warning=FALSE}
+gene_info <- data.frame(
+  grch38 %>% 
+  filter(symbol %in% rownames(log_qpcr)) %>%
+  filter(chr %in% 1:23) %>%
+  transmute(gene_id = ensgene,
+            gene_name = symbol,
+            chr = chr,
+            star = start,
+            end = end,
+            strand = strand,
+            biotype = biotype)
+)
+
+rownames(gene_info) <- gene_info$gene_name
+gene_info <- gene_info[rownames(log_qpcr),]
+
+head(gene_info)
+```
+
+Finally, we combine all of this information to build into a SummarizedExperiment object.
+```{r create_summarized_experiment, message=FALSE, warning=FALSE}
+gains_qpcr <- SummarizedExperiment(assays = log_qpcr,
+                                   colData = sample_info,
+                                   rowData = gene_info)
+gains_qpcr
+```
+
+## Exploratory data analysis
+Performing principal component analysis based on the 7 genes.
+```{r perform_pca, message=FALSE, warning=FALSE}
+pca <- prcomp(t(assay(gains_qpcr)))
+
+pc_coords <- data.frame(cbind(pca$x, colData(gains_qpcr)))
+pc_variance <- pca$sdev^2/sum(pca$sdev^2)
+```
+
+```{r plot_pca, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(SRSModel), shape=Dataset), size=3) +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), na.value="grey", name="Endotype", labels=c("SRS1","SRS2")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+## Batch regression
+The PCA analysis above reveals a clear batch effect, where samples from the MSc data set are clustering separately to the rest of the samples. We thus remove this batch effect using limma.
+
+```{r remove_batch_effect, message=FALSE, warning=FALSE}
+assay(gains_qpcr) <- removeBatchEffect(assay(gains_qpcr), 
+                                       batch = gains_qpcr$Dataset)
+```
+
+We then perform principal component analysis on the batch corrected data.
+```{r perform_pca_on_batch_corrected_data, message=FALSE, warning=FALSE}
+pca <- prcomp(t(assay(gains_qpcr)))
+
+pc_coords <- data.frame(cbind(pca$x, colData(gains_qpcr)))
+pc_variance <- pca$sdev^2/sum(pca$sdev^2)
+```
+
+```{r plot_pca_batch_corrected, message=FALSE, warning=FALSE, echo=FALSE}
+ggplot(pc_coords, aes(x=PC1, y=PC2)) + 
+  geom_point(aes(color=as.factor(SRSModel), shape=Dataset), size=3) +
+  xlab(paste("PC1 (", round(pc_variance[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_variance[2]*100,2), "% variance explained)")) +
+  scale_color_manual(values=c("#ef8a62","#67a9cf"), na.value="grey", name="Endotype", labels=c("SRS1","SRS2")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+The batch effect has now dissappeared, and over half of the variance is now explained by SRS group. 
+
+## Saving results
+We export the cleaned and batch-corrected qPCR measurements as an R data set.
+```{r export_as_rds, message=FALSE, warning=FALSE, eval=FALSE}
+saveRDS(gains_qpcr, "../data/gains_qpcr_deduped_log2-transformed_batch-corrected.rds")
+```
+
+## R session details
+```{r r_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```
+

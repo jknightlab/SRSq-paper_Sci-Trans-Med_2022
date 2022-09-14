@@ -1,0 +1,590 @@
+---
+title: "Exploratory analysis and stratification of pediatric sepsis transcriptomes"
+author: "Eddie Cano-Gamez"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading libraries
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(affy)
+library(annotables)
+library(SummarizedExperiment)
+library(limma)
+library(qusage)
+library(SepstratifieR)
+library(XGR)
+library(ggrepel)
+library(ggExtra)
+library(ggpubr)
+library(cowplot)
+library(UpSetR)
+```
+
+## Loading data
+Loading an Affymetrix microarray data set (CEL files) containing whole blood transriptomes of paediatric patients with SIRS, sepsis, or septic shock, as well as healthy controls.
+```{r load_data, message=FALSE, warning=FALSE}
+wong_affy <- ReadAffy(celfile.path = "../data/Wong-et-al_2009_Critical-care-medicine/CEL_files/")
+```
+
+Sample metadata
+```{r load_metadata, message=FALSE, warning=FALSE}
+wong_metadata <- read.table("../data/Wong-et-al_2009_Critical-care-medicine/GSE13904_metadata.txt", header=T, sep = "\t", row.names = 1)
+```
+
+## Data pre-processing
+### Background correction, normalization, and summarization
+We use the RMA algorithm for data processing.
+```{r background_correction_and_normalization, message=FALSE, warning=FALSE}
+wong_rma <- rma(wong_affy)
+```
+
+Formatting sample names to match metadata table
+```{r format_column_names, message=FALSE, warning=FALSE}
+colnames(wong_rma) <- gsub(".CEL.gz$","",colnames(wong_rma))
+```
+
+### Probe filtering
+Microarray probes are filtered according to the following criteria:
+
+1. Any probes mapping to more than one gene (i.e. multi-mapping probes) are removed
+2. Any probes for which no gene annotation is available are removed
+3. Only probes actually present in the expression table are kept
+
+```{r filter_affymetrix_probes, message=FALSE, warning=FALSE}
+# Loading Affymetrix U133 microarray probe annotations
+probe_annotations <- read_tsv("../data/Wong-et-al_2009_Critical-care-medicine/GPL570_probe-annotations.txt")
+
+# Removing probes without gene annotations
+probe_annotations <- probe_annotations[!is.na(probe_annotations$`Gene symbol`),]
+
+# Removing multi-mapping probes
+probe_annotations <- probe_annotations[grep("///",probe_annotations$`Gene symbol`, invert = T),]
+
+# Keeping only probes present in the expression table
+probes_in_study <- intersect(rownames(wong_rma), probe_annotations$ID)
+
+rownames(probe_annotations) <- probe_annotations$ID
+probe_annotations <- probe_annotations[probes_in_study,]
+
+wong_rma <- wong_rma[probe_annotations$ID,]
+
+# Removing unnecessary columns and re-formatting column names
+probe_annotations <- probe_annotations[,c("ID","Gene symbol", "GenBank Accession", "Chromosome location")]
+colnames(probe_annotations) <- c("probe_id", "gene_name", "genebank_id", "genomic_pos")
+```
+
+The resulting probe annotations are as follows:
+```{r head_affymetrix_probes, message=FALSE, warning=FALSE}
+head(probe_annotations)
+```
+
+### Collapsing measurements at the gene level
+Identifying lists present in this study.
+```{r list_genes_in_study, message=FALSE, warning=FALSE}
+genes_in_study <- unique(probe_annotations$gene_name)
+```
+
+Averaging all probes mapping to a given gene.
+```{r average_measurements_per_gene, message=FALSE, warning=FALSE}
+wong_gex_per_gene <- sapply(genes_in_study, FUN=function(gene){
+  probe_ids <-  unique(as.character(probe_annotations$probe_id[probe_annotations$gene_name == gene]))
+  probe_levels <- exprs(wong_rma[probe_ids,])
+  gene_levels <- colMeans(probe_levels)
+  
+  return(gene_levels)
+})
+
+wong_gex_per_gene <- data.frame(t(wong_gex_per_gene))
+```
+
+The resulting expression table is as follows:
+```{r head_MESSI_gex_per_gene, message=FALSE, warning=FALSE}
+wong_gex_per_gene[1:5,1:5]
+```
+### Creating a gene annotation table
+Retrieving gene annotations form Ensembl using the annotables package.
+```{r create_gene_annotations, message=FALSE, warning=FALSE}
+gene_annotations <- probe_annotations[,c("gene_name","genebank_id")]
+gene_annotations <- gene_annotations[!duplicated(gene_annotations$gene_name),]
+
+rownames(gene_annotations) <- gene_annotations$gene_name
+
+gene_annotations <- gene_annotations[rownames(wong_gex_per_gene), ]
+
+# Fetching Ensembl IDs based of GRCh38
+gene_annotations$gene_id <- sapply(gene_annotations$gene_name, FUN=function(gene){
+  gene_ids <- unique(grch38$ensgene[grch38$symbol == gene])
+  if( length(gene_ids) == 0 ) {
+    return(NA)
+  } else{
+    return(gene_ids[1])
+  }
+})
+
+head(gene_annotations)
+```
+
+### Formatting sample metadata
+Re-formatting the metadata available for these paediatric samples.
+```{r reformat_metadata, message=FALSE, warning=FALSE}
+wong_metadata$Phenotype_broad <- gsub("SIRS_resolved","SIRS",wong_metadata$Phenotype)
+wong_metadata$Sample_name_short <- gsub("(A|B|C)$","",wong_metadata$Sample_name)
+```
+
+### Creating a Summarized Experiment object
+Storing log-RMA expression measurements, gene, and sample metadata in a single R object.
+```{r create_summarized_experiment, message=FALSE, warning=FALSE}
+wong <- SummarizedExperiment(assays = wong_gex_per_gene,
+                              rowData = gene_annotations,
+                              colData = wong_metadata)
+
+wong
+```
+
+## Exploratory data analysis
+We perform PCA based on all genes to assess general gene expression patterns in this data set.
+```{r perform_PCA, message=FALSE, warning=FALSE}
+pca_res <- prcomp(t(assay(wong)))
+```
+
+The first three principal components seem to account for almost half of the variance. 
+```{r plot_pc_variances, message=FALSE, warning=FALSE}
+pc_vars <- pca_res$sdev^2/sum(pca_res$sdev^2)
+plot(pc_vars[1:50],
+     type="b",
+     cex=0.5,
+     xlab="Principal Component",
+     ylab="Proportion of variance explained")
+
+```
+
+PC2 separates controls from patients, although the separation is not complete and controls overlap with the patient population, especially with patients at 3 days post PICU admission.
+```{r plot_PCA, message=FALSE, warning=FALSE, echo=FALSE}
+pc_coords <- data.frame(cbind(pca_res$x, colData(wong)))
+pc_coords$Phenotype <- factor(pc_coords$Phenotype, 
+                              levels=c("Control","SIRS_resolved","SIRS","Sepsis","Septic_shock"))
+pc_coords$Phenotype_broad <- factor(pc_coords$Phenotype_broad, 
+                                    levels=c("Control","SIRS","Sepsis","Septic_shock"))
+
+g1 <- ggplot(pc_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=Phenotype_broad), size=4) +
+  scale_color_manual(values=c("#542788","#998ec3","#f1a340","#b35806")) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom")
+ggMarginal(g1, type = "density", groupFill = T)
+
+ggplot(pc_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=as.factor(Days_since_admission)), size=4) +
+  scale_color_manual(values=c("#542788","#998ec3")) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom")
+
+```
+
+## Stratification into SRS groups
+Not all genes present in the extended signature are available here (due to TTC3 not being reliably measured in the Affymetric array, where the only probe mapping to this gene also maps to a pseudogene in the X chromosome). Thus, we use the original 7-gene signature by Davenport et al. as a basis for patient stratification.
+```{r load_predictor_genes, message=FALSE, warning=FALSE}
+predictors <- read.table("../results/extended-predictor-gene-set.tsv", sep="\t", header=T)
+predictors
+```
+
+We getch the expression values for all predictor genes.
+```{r fetch_predictors, message=FALSE, warning=FALSE}
+wong_predictors <- data.frame(t(assay(wong[intersect(rownames(wong), predictors$gene_name),])))
+
+wong_predictors <- wong_predictors[,setdiff(predictors$gene_name,"TTC3")]
+colnames(wong_predictors) <- setdiff(predictors$gene_id,"ENSG00000182670")
+
+head(wong_predictors)
+```
+
+We then use SepstratifieR to obtain SRS assignments and SRSq estimates for these patients.
+```{r stratify_samples, message=FALSE, warning=FALSE}
+preds <- stratifyPatients(wong_predictors, gene_set = "davenport", k = 50)
+
+wong$SRS <- preds@SRS
+wong$SRSq <- preds@SRSq
+```
+
+The alignment to the GAinS reference set is not perfect, but overall seems to work.
+```{r plot_sample_alignment, message=FALSE, warning=FALSE}
+plotAlignedSamples(preds)
+```
+
+PCA reveals that SRS (and SRSq) correlates with PC2.
+```{r plot_pca_by_SRS, message=FALSE, warning=FALSE}
+pc_coords$SRS <- wong$SRS
+pc_coords$SRSq <- wong$SRSq
+
+g1 <- ggplot(pc_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=SRS), size=4) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom")
+ggMarginal(g1, type = "density", groupFill = T)
+
+ggplot(pc_coords, aes(x=PC1, y=PC2)) +
+  geom_point(aes(color=SRSq), size=4) +
+  xlab(paste("PC1 (", round(pc_vars[1]*100,2), "% variance explained)")) +
+  ylab(paste("PC2 (", round(pc_vars[2]*100,2), "% variance explained)")) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom")
+```
+
+The breakdown of SRS endotypes by diagnostic group is as follows:
+```{r tabulate_SRS_by_severity, message=FALSE, warning=FALSE, echo=FALSE}
+table(wong$SRS, wong$Phenotype_broad)
+```
+
+This can also be visualised by means of an UpSet plot:
+```{r create_severity_vs_SRS_upset_plot, message=FALSE, warning=FALSE, echo=FALSE}
+upset(
+  fromList(
+    list(
+      "SRS1" = colnames(wong)[wong$SRS=="SRS1"],
+      "SRS2" = colnames(wong)[wong$SRS=="SRS2"],
+      "SRS3" = colnames(wong)[wong$SRS=="SRS3"],
+      "Control" = colnames(wong)[wong$Phenotype_broad=="Control"],
+      "SIRS" = colnames(wong)[wong$Phenotype_broad=="SIRS"],
+      "Sepsis" = colnames(wong)[wong$Phenotype_broad=="Sepsis"],
+      "Septic shock" = colnames(wong)[wong$Phenotype_broad=="Septic_shock"]
+      )
+    ), 
+  order.by = "freq", 
+  sets = c("Septic shock","Sepsis", "SIRS", "Control", "SRS1", "SRS2", "SRS3"), 
+  keep.order = T
+)
+```
+
+Moreover, it can also be represented in terms of Jaccard indexes.
+```{r define_getJaccardIndex, message=FALSE, warning=FALSE}
+getJaccardIndex <- function(a,b){
+  if( length(union(a,b)) == 0 ){
+    jaccard_index = 0
+  } else{
+   jaccard_index = length(intersect(a,b))/length(union(a,b)) 
+  }
+  
+  return(jaccard_index)
+}
+```
+
+
+```{r plot_jaccard_indexes_SRS_vs_severity, message=FALSE, warning=FALSE, echo=FALSE}
+jaccard_indexes <- data.frame(
+  sapply(unique(wong$Phenotype_broad), FUN=function(i) {
+    sapply(unique(wong$SRS), FUN=function(j){
+      getJaccardIndex(colnames(wong)[wong$Phenotype_broad == i], 
+                      colnames(wong)[wong$SRS==j])
+      })
+    })
+  )
+rownames(jaccard_indexes) <- unique(wong$SRS)
+
+pheatmap::pheatmap(t(jaccard_indexes), cellheight=25, cellwidth=30, show_colnames = T)
+```
+
+Finally, we assess the average SRSq value of patients in differnet diagnositc groups and at different times post PICU-admission.
+```{r plot_SRSq_by_phenotypic_group, message=FALSE, warning=FALSE}
+pc_coords$Phenotype_time_point <- paste(pc_coords$Phenotype_broad, paste("(day ", pc_coords$Days_since_admission,")", sep=""))
+pc_coords$Phenotype_time_point <- factor(pc_coords$Phenotype_time_point,
+       levels=c("Control (day 1)",
+                "SIRS (day 1)",
+                "SIRS (day 3)",
+                "Sepsis (day 1)",
+                "Sepsis (day 3)",
+                "Septic_shock (day 1)",
+                "Septic_shock (day 3)"))
+
+
+ggplot(pc_coords, aes(x=Phenotype_broad, y=SRSq)) +
+  geom_boxplot() +
+  geom_jitter(color="darkgrey", width=0.1, size=3) +
+  scale_color_manual(values=c("darkred","steelblue","darkblue")) +
+  stat_compare_means(comparisons = list(
+    c("Control","SIRS"),
+    c("SIRS","Sepsis"),
+    c("Sepsis","Septic_shock")
+    ), ) +
+  xlab("") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        legend.position = "right", 
+        axis.text.x = element_text(angle = 90))
+
+ggplot(pc_coords[pc_coords$Phenotype_time_point != "Control (day 1)",], aes(x=as.factor(Days_since_admission), y=SRSq)) +
+  geom_boxplot() +
+  facet_grid(~Phenotype_broad) +
+  geom_jitter(color="darkgrey", width=0.1, size=3) +
+  xlab("") +
+  stat_compare_means() +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        legend.position = "right", 
+        axis.text.x = element_text(angle = 90))
+```
+
+## Identifying SRS-associated gene expression programs
+Let's now use limma to identify genes whose expression levels are associated with SRSq.
+
+We start by defining a model matrix, with SRS/SRSq as the independent variable. 
+```{r define_design_matrix, message=FALSE, warning=FALSE}
+# SRS
+#wong <- wong[,wong$Phenotype == "Septic_shock"]
+SRS_labels <- factor(wong$SRS, levels = c("SRS1","SRS2","SRS3"))
+design_matrix_SRS <- model.matrix( ~ 0 + SRS_labels)
+colnames(design_matrix_SRS) <-c("SRS1","SRS2","SRS3")
+
+# SRSq
+design_matrix_SRSq <- model.matrix(~wong$SRSq)
+```
+
+We then test for an association between gene expression level and SRSq using limma.
+```{r test_for_differential_expression, message=FALSE, warning=FALSE}
+# SRS
+fit_SRS <- lmFit(assay(wong), design_matrix_SRS)
+contrast_matrix_SRS <- makeContrasts(SRS1-SRS2, levels=design_matrix_SRS)
+
+fit2_SRS <- contrasts.fit(fit_SRS, contrast_matrix_SRS)
+fit2_SRS <- eBayes(fit2_SRS)
+
+# SRSq
+fit_SRSq <- lmFit(assay(wong), design_matrix_SRSq)
+
+fit2_SRSq <- contrasts.fit(fit_SRSq, coef = 2)
+fit2_SRSq <- eBayes(fit2_SRSq)
+```
+
+Finally, we retrieve the relevant statistics for any differentially expressed genes from limma's fit objects.We define differentially expressed genes as |fold change| >= 3.5 at an FDR <= 0.05. A fold-change of 3.5 is approximately equivalent to a 1-fold increase in gene expression for every 0.3-unit increase in SRSq. 
+```{r extract_DE_genes, message=FALSE, warning=FALSE}
+# SRS
+DEGs_SRS <- topTable(fit2_SRS, adjust="BH", number = nrow(wong))
+DEGs_SRS$gene_id <- rownames(DEGs_SRS)
+DEGs_SRS$gene_name <- rowData(wong)[DEGs_SRS$gene_id,]$gene_name
+DEGs_SRS$DE <- abs(DEGs_SRS$logFC) >= log2(1.5) & DEGs_SRS$adj.P.Val <= 0.05
+
+# SRSq
+DEGs_SRSq <- topTable(fit2_SRSq, adjust="BH", number = nrow(wong))
+DEGs_SRSq$gene_name <- rownames(DEGs_SRSq)
+DEGs_SRSq$gene_id <- rowData(wong)[DEGs_SRSq$gene_name,]$Ensembl_ID
+DEGs_SRSq$DE <- abs(DEGs_SRSq$logFC) >= log2(3.5) & DEGs_SRSq$adj.P.Val <= 0.05
+```
+
+A volcano plot representation of differentialy expressed genes looks as follows:
+```{r create_volcano_plot, message=FALSE, warning=FALSE, echo=FALSE}
+# SRS
+top_genes_SRS <- c(rownames(DEGs_SRS[DEGs_SRS$DE==T & DEGs_SRS$logFC > 0,])[1:15],
+                    rownames(DEGs_SRS[DEGs_SRS$DE==T & DEGs_SRS$logFC < 0,])[1:10])
+
+ggplot(DEGs_SRS, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRS, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRS[top_genes_SRS,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle("SRS-associated genes") +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+
+# SRSq
+top_genes_SRSq <- c(rownames(DEGs_SRSq[DEGs_SRSq$DE==T & DEGs_SRSq$logFC > 0,])[1:15],
+                    rownames(DEGs_SRSq[DEGs_SRSq$DE==T & DEGs_SRSq$logFC < 0,])[1:10])
+
+ggplot(DEGs_SRSq, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRSq, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRSq[top_genes_SRSq,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRSq-associated genes")) +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+```
+
+Below are some example genes known to be differentially expressed between SRS groups in GAinS. Direction of effects are consistent, but effect sizes tend to be smaller.
+```{r create_volcano_plot_example_genes, message=FALSE, warning=FALSE, echo=FALSE}
+example_genes <- c("ADGRE3","GZMK","CD27","GZMH","CCR3","HLA-DMB","HLA-C","CD6","CD177","MMP8","HPGD","TDRD9","GPR84","TNFAIP8L3")
+# SRS
+ggplot(DEGs_SRS, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRS, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRS[example_genes,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRS-associated genes\n", "(Wong et al.)")) +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+
+
+# SRSq
+ggplot(DEGs_SRSq, aes(x=logFC, y=-log10(adj.P.Val))) +
+  geom_point(data=DEGs_SRSq, aes(color=DE)) +
+  geom_label_repel(data=DEGs_SRSq[example_genes,],
+             aes(label=gene_name, color=DE), size=3, alpha=0.85) +
+  scale_color_manual(values=c("darkgrey","darkred")) +
+  xlab("log-fold change (LFC)") +
+  ylab("-log10( P value )") +
+  ggtitle(paste("SRSq-associated genes\n", "(Wong et al.)")) +
+  theme_classic() +
+  theme(legend.position="none",  
+        plot.title = element_text(hjust=0.5))
+```
+
+Furthermore, below are six example genes known to be among the top SRSq-associated genes in GAinS. All pass FDR-correction in this cohort and their direction of effect is consistent.
+```{r plot_gex_vs_SRSq_microarray, message=FALSE, warning=FALSE, echo=FALSE}
+gains_top_genes <- c("PGS1","GYG1","MCEMP1","WDR75","PIEZO1","BMS1")
+cat(mean(DEGs_SRSq[gains_top_genes,]$adj.P.Val < 0.05)*100,"% of top SRSq-associated genes in GAinS also pass FDR correction in Wong et al.\n", sep="")
+DEGs_SRSq[gains_top_genes,]
+
+par(mfrow=c(2,3))
+for(i in gains_top_genes){
+  print(
+    plot(wong$SRSq,
+     assay(wong[i,]),
+     col = wong$SRS,
+     main=i,
+     xlab="SRSq",
+     ylab="Log-transformed expression",
+     pch=19)
+  )
+}
+```
+
+Let's compare these fold-change estimates with those calculated in the GAinS cohort.
+```{r load_gains_LFCs, message=FALSE, warning=FALSE}
+DEGs_gains <- read.table("../results/differential_gene_expression/GAinS/GAinS-microarray_DEGs_SRSq_limma.tsv", sep="\t", header=T)
+
+rownames(DEGs_gains) <- DEGs_gains$gene_name
+```
+
+```{r find_shared_genes, message=FALSE, warning=FALSE}
+shared_genes <- intersect(rownames(DEGs_gains), rownames(DEGs_SRSq))
+```
+
+```{r compute_LFC_corelation, message=FALSE, warning=FALSE}
+cor_res <- cor.test(DEGs_gains[shared_genes,]$logFC, DEGs_SRSq[shared_genes,]$logFC)
+cor_res
+```
+
+
+Approximately 11,000 genes are detected in both studies and there is a significant correlation between SRSq-associated log-fold changes in both studies. However, effect sizes tend to be much smaller in the paediatric cohort.
+
+This correlation looks as follows:
+
+```{r plot_LFC_correlation, message=FALSE, warning=FALSE, echo=FALSE}
+plot(DEGs_gains[shared_genes,]$logFC,
+     DEGs_SRSq[shared_genes,]$logFC,
+     col="darkgrey",
+     pch=19,
+     xlab="LFC in adult sepsis (GAinS)",
+     ylab="LFC in paediatric sepsis (Wong et al.)",
+     main=paste("Cor =", round(cor_res$estimate,2), "\np < 2.2e-16"))
+```
+
+Let's export these results as a text file for future reference.
+```{r export_DE_genes, eval=FALSE}
+# SRS
+write.table(DEGs_SRS[order(-DEGs_SRS$logFC),], 
+            file = "../results/differential_gene_expression/Wong-et-al/Wong-et-al_DEGs_SRS1-vs-SRS2_limma_davenport-signature.tsv",
+            quote = F, row.names = F, sep="\t")
+
+# SRSq
+write.table(DEGs_SRSq[order(-DEGs_SRSq$logFC),], 
+            file = "../results/differential_gene_expression/Wong-et-al/Wong-et-al_DEGs_SRSq_limma_davenport-signature.tsv",
+            quote = F, row.names = F, sep="\t")
+```
+
+### Pathway enrichment analysis
+Next, let's assess whether genes positively or negatively associated with SRSq are enriched in any relevant biological pathways. We use the XGR method to test for enrichment in REACTOME pathways.
+```{r run_XGR, eval=FALSE}
+# Upregulated genes
+XGR_up <- xEnricherGenes(data=DEGs_SRSq$gene_name[DEGs_SRSq$DE & DEGs_SRSq$logFC > 0],
+                         background = DEGs_SRSq$gene_name,
+                         ontology="	MsigdbC2REACTOME")
+
+# Downregulated genes
+XGR_down <- xEnricherGenes(data=DEGs_SRSq$gene_name[DEGs_SRSq$DE & DEGs_SRSq$logFC < 0], 
+                                       background = DEGs_SRSq$gene_name,
+                                       ontology="MsigdbC2REACTOME")
+```
+
+```{r load_XGR_results, warning=FALSE, message=FALSE, echo=FALSE}
+load("../results/differential_gene_expression/Wong-et-al/XGR-results-Wong-et-al_davenport-signature.rdata")
+```
+
+We then subset these results to include only significantly-enriched biological terms.
+```{r format_XGR_results, warning=FALSE, message=FALSE}
+## Reformatting results table
+XGR_up <- xEnrichViewer(XGR_up, top_num=length(XGR_up$adjp), sortBy="fc", details=TRUE)
+XGR_down <- xEnrichViewer(XGR_down, top_num=length(XGR_down$adjp), sortBy="fc", details=TRUE)
+
+## Keeping only significantly enriched pathways
+XGR_up <- XGR_up[XGR_up$adjp <= 0.05,]
+XGR_down <- XGR_down[XGR_down$adjp <= 0.05,]
+```
+
+In order to simplify the full output, we will focus exclusively on pathways matching at least one word in a bank of common immune terms.
+```{r define_immune_terms, message=FALSE, warning=FALSE}
+immune_terms <- c("NOTCH","TLR","Interleukin","NFk","MHC","(m|M)etabolism","Immun","ZAP-70","PD(-)?1","TCR","BCR","CD28","mTORC","SMAD","IFN","TGF","TRAF","Inflam","IRF","CTLA(-)?4","CD3","Interferon")
+```
+
+When assessing pathway enrichment, the results look as follows:
+```{r plot_SRS_associated_pathways, message=FALSE, warning=FALSE, echo=FALSE}
+XGR_up$name <- factor(XGR_up$name, levels=rev(XGR_up$name[order(-XGR_up$or)]))
+ggplot(XGR_up[grepl(paste(immune_terms, collapse="|"), XGR_up$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkred") +
+  geom_hline(yintercept = log2(1), color="darkred", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("Positive enrichment along SRSq") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+
+XGR_down$name <- factor(XGR_down$name, levels=rev(XGR_down$name[order(-XGR_down$or)]))
+ggplot(XGR_down[grepl(paste(immune_terms, collapse="|"), XGR_down$name),], aes(x=name, y=log2(or))) +
+  geom_errorbar(aes(ymin=log2(CIl), ymax=log2(CIu)), color="darkgrey") +
+  geom_point(size=2.5, color="darkblue") +
+  geom_hline(yintercept = log2(1), color="darkblue", linetype="dashed") +
+  coord_flip() +
+  ylab("log2(fold enrichment)") +
+  ggtitle("Negative enrichment along SRSq") +
+  theme_classic() +
+  theme(axis.title.y = element_blank(),
+        plot.title = element_text(hjust=0.5))
+```
+
+## Exporting results
+Saving results as RDS object.
+```{r save_summarized_object, eval=FALSE}
+saveRDS(wong, "../data/Wong-et-al_2009_Critical-care-medicine/Wong-et-al_log-RMA-transformed_gex-by-gene.rds")
+```
+
+## R session
+```{r R_session, message=FALSE, warning=FALSE}
+sessionInfo()
+```
+
